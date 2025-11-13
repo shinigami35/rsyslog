@@ -60,6 +60,10 @@ Input Parameters
      - .. include:: ../../reference/parameters/omhttp-healthchecktimeout.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-omhttp-healthchecktimedelay`
+     - .. include:: ../../reference/parameters/omhttp-healthchecktimedelay.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
    * - :ref:`param-omhttp-httpcontenttype`
      - .. include:: ../../reference/parameters/omhttp-httpcontenttype.rst
         :start-after: .. summary-start
