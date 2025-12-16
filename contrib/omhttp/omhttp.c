@@ -207,6 +207,16 @@ struct modConfData_s {
 };
 static modConfData_t *loadModConf = NULL; /* modConf ptr to use for the current load process */
 
+typedef struct serverData_s {
+    CURL *curlCheckConnHandle; /* libcurl session handle for checking the server connection */
+    CURL *curlPostHandle; /* libcurl session handle for posting data to the server */
+    HEADER *curlHeader; /* json POST request info */
+    uchar *fullUrlPost; /* Keep the full url in cache if dynRestPath is off else last URL used */
+    uchar *fullUrlHealth; /* Keep the full url healthCheck in cache */
+    uchar *restPATH; /* Keep restPath last used */
+    time_t lastCheck;
+} serverData_t;
+
 typedef struct wrkrInstanceData {
     PTR_ASSERT_DEF
     instanceData *pData;
@@ -232,6 +242,11 @@ typedef struct wrkrInstanceData {
         size_t curLen;
         size_t len;
     } compressCtx;
+
+
+    // added
+    serverData_t **listServerDataWkr;
+
 } wrkrInstanceData_t;
 
 /* tables for interfacing with the v6 config system */
@@ -334,6 +349,22 @@ BEGINcreateWrkrInstance
     }
     initCompressCtx(pWrkrData);
     iRet = curlSetup(pWrkrData);
+
+    //added
+    pWrkrData->listServerDataWkr = (serverData_t **)malloc(sizeof(serverData_t *) * pWrkrData->pData->numServers);
+    for (int i = 0; i < pWrkrData->pData->numServers; i++){
+        serverData_t tmp_serverData = (serverData_t *) malloc(sizeof(serverData_t))
+        tmp_serverData->curlCheckConnHandle = NULL;
+        tmp_serverData->curlPostHandle = NULL;
+        tmp_serverData->curlHeader = NULL;
+        tmp_serverData->fullUrlPost = NULL;
+        tmp_serverData->fullUrlHealth = NULL;
+        tmp_serverData->restPATH = NULL;
+        tmp_serverData->lastCheck = NULL;
+
+        pWrkrData->listServerDataWk[i] = tmp_serverData;
+    }
+
 ENDcreateWrkrInstance
 
 BEGINisCompatibleWithFeature
@@ -383,6 +414,8 @@ BEGINfreeInstance
         free(pData->listObjStats);
     }
     free(pData->statsName);
+
+   
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -399,6 +432,32 @@ BEGINfreeWrkrInstance
         free(pWrkrData->batch.restPath);
         pWrkrData->batch.restPath = NULL;
     }
+
+     //added
+    if (pWrkrData->listServerDataWkr != NULL){
+        for (int i = 0; i < pWrkrData->pData->numServers; i++){
+            if (pWrkrData->listServerDataWkr[i]->curlHeader != NULL) {
+                curl_slist_free_all(pWrkrData->listServerDataWkr[i]->curlHeader);
+                pWrkrData->listServerDataWkr[i]->curlHeader = NULL;
+            }
+            if (pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL) {
+                curl_easy_cleanup(pWrkrData->listServerDataWkr[i]->curlCheckConnHandle);
+                pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = NULL;
+            }
+            if (pWrkrData->listServerDataWkr[i]->curlPostHandle != NULL) {
+                curl_easy_cleanup(pWrkrData->listServerDataWkr[i]->curlPostHandle);
+                pWrkrData->listServerDataWkr[i]->curlPostHandle = NULL;
+            }
+            if(pWrkrData->listServerDataWkr[i]->fullUrlPost) free(pWrkrData->listServerDataWkr[i]->fullUrlPost);
+            if(pWrkrData->listServerDataWkr[i]->fullUrlHealth) free(pWrkrData->listServerDataWkr[i]->fullUrlHealth);
+            if(pWrkrData->listServerDataWkr[i]->restPATH) free(pWrkrData->listServerDataWkr[i]->restPATH);
+
+            pWrkrData->listServerDataWkr[i] = NULL;   
+        }
+        free(pWrkrData->listServerDataWkr);
+        pWrkrData->listServerDataWkr = NULL;
+    }
+
 
     if (pWrkrData->bzInitDone) deflateEnd(&pWrkrData->zstrm);
     freeCompressCtx(pWrkrData);
@@ -547,9 +606,10 @@ static inline void incrementServerIndex(wrkrInstanceData_t *pWrkrData) {
  * needs to switch server, will record new one in curl handle.
  */
 static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
-    CURL *curl;
+    CURL *curl = NULL;
     CURLcode res;
     es_str_t *urlBuf = NULL;
+    serverData_s *serverData = NULL;
     char *healthUrl;
     char *serverUrl;
     char *checkPath;
@@ -564,7 +624,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 
     pWrkrData->reply = NULL;
     pWrkrData->replyLen = 0;
-    curl = pWrkrData->curlCheckConnHandle;
     urlBuf = es_newStr(256);
     if (urlBuf == NULL) {
         LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to allocate buffer for health check uri.");
@@ -572,22 +631,32 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     }
 
     for (i = 0; i < pWrkrData->pData->numServers; ++i) {
-        serverUrl = (char *)pWrkrData->pData->serverBaseUrls[pWrkrData->serverIndex];
-        checkPath = (char *)pWrkrData->pData->checkPath;
 
-        es_emptyStr(urlBuf);
-        r = es_addBuf(&urlBuf, serverUrl, strlen(serverUrl));
-        if (r == 0 && checkPath != NULL) r = es_addBuf(&urlBuf, checkPath, strlen(checkPath));
-        if (r == 0) healthUrl = es_str2cstr(urlBuf, NULL);
-        if (r != 0 || healthUrl == NULL) {
-            LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to allocate buffer for health check uri.");
-            ABORT_FINALIZE(RS_RET_SUSPENDED);
+        if(pWrkrData->listServerDataWkr[i] != NULL
+           && pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL) {
+            curl = serverData->curlCheckConnHandle;
         }
+        if (curl == NULL) {
+            curl = pWrkrData->curlCheckConnHandle;
+            serverUrl = (char *)pWrkrData->pData->serverBaseUrls[pWrkrData->serverIndex];
+            checkPath = (char *)pWrkrData->pData->checkPath;
 
-        curlCheckConnSetup(pWrkrData);
-        curl_easy_setopt(curl, CURLOPT_URL, healthUrl);
+            es_emptyStr(urlBuf);
+            r = es_addBuf(&urlBuf, serverUrl, strlen(serverUrl));
+            if (r == 0 && checkPath != NULL) r = es_addBuf(&urlBuf, checkPath, strlen(checkPath));
+            if (r == 0) healthUrl = es_str2cstr(urlBuf, NULL);
+            if (r != 0 || healthUrl == NULL) {
+                LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to allocate buffer for health check uri.");
+                ABORT_FINALIZE(RS_RET_SUSPENDED);
+            }
+
+            curlCheckConnSetup(pWrkrData);
+            curl_easy_setopt(curl, CURLOPT_URL, healthUrl);
+
+            pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = curl;
+        }
         res = curl_easy_perform(curl);
-        free(healthUrl);
+        if (healthUrl != NULL) free(healthUrl);
 
         if (res == CURLE_OK) {
             DBGPRINTF(
@@ -702,7 +771,7 @@ static rsRetVal renderJsonErrorMessage(wrkrInstanceData_t *pWrkrData, uchar *req
         ABORT_FINALIZE(RS_RET_ERR);
     }
 
-#define ERR_MSG_NULL "NULL: curl request failed or no response"
+    #define ERR_MSG_NULL "NULL: curl request failed or no response"
     fjson_object_object_add(res, "status", fjson_object_new_int(pWrkrData->httpStatusCode));
     if (pWrkrData->reply == NULL) {
         fjson_object_object_add(res, "message", fjson_object_new_string_len(ERR_MSG_NULL, strlen(ERR_MSG_NULL)));
