@@ -199,6 +199,9 @@ typedef struct instanceConf_s {
     /* Stats Counter */
     targetStats_t *listObjStats;
     sbool statsBySenders;
+
+    time_t *lastHealthCheck;
+    long healthCheckTimeDelay;  // Delay between two Health Check (in seconds)
 } instanceData;
 
 struct modConfData_s {
@@ -215,6 +218,7 @@ typedef struct serverData_s {
     uchar *fullUrlHealth; /* Keep the full url healthCheck in cache */
     uchar *restPATH; /* Keep restPath last used */
     time_t lastCheck;
+    int firstInit;
 } serverData_t;
 
 typedef struct wrkrInstanceData {
@@ -288,12 +292,13 @@ static struct cnfparamdescr actpdescr[] = {
     {"httpignorablecodes", eCmdHdlrArray, 0},
     {"profile", eCmdHdlrGetWord, 0},
     {"statsbysenders", eCmdHdlrBinary, 0},
+    {"healthchecktimedelay", eCmdHdlrInt, 0},
 };
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
 static rsRetVal curlSetup(wrkrInstanceData_t *pWrkrData);
 static void curlCleanup(wrkrInstanceData_t *pWrkrData);
-static void curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData);
+static void ATTR_NONNULL() curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData);
 
 /* compressCtx functions */
 static void ATTR_NONNULL() initCompressCtx(wrkrInstanceData_t *pWrkrData);
@@ -339,20 +344,23 @@ BEGINcreateWrkrInstance
             pWrkrData->batch.restPath = NULL;
         }
     }
-
+    DBGPRINTF("omhttp: BEGINcreateWrkrInstance\n");
     //added
-    pWrkrData->listServerDataWkr = (serverData_t **)malloc(sizeof(serverData_t *) * pWrkrData->pData->numServers);
+    pWrkrData->listServerDataWkr = malloc(sizeof(serverData_t *) * pWrkrData->pData->numServers);
+    DBGPRINTF("omhttp: BEGINcreateWrkrInstance : Malloc listServer\n");
     for (int i = 0; i < pWrkrData->pData->numServers; i++){
-        serverData_t tmp_serverData = (serverData_t *) malloc(sizeof(serverData_t))
-        tmp_serverData->curlCheckConnHandle = NULL;
-        tmp_serverData->curlPostHandle = NULL;
-        tmp_serverData->curlHeader = NULL;
-        tmp_serverData->fullUrlPost = NULL;
-        tmp_serverData->fullUrlHealth = NULL;
-        tmp_serverData->restPATH = NULL;
-        tmp_serverData->lastCheck = NULL;
+        pWrkrData->listServerDataWkr[i] = (serverData_t *) malloc(sizeof(serverData_t));
+        pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = NULL;
+        pWrkrData->listServerDataWkr[i]->curlPostHandle = NULL;
+        pWrkrData->listServerDataWkr[i]->curlHeader = NULL;
+        pWrkrData->listServerDataWkr[i]->fullUrlPost = NULL;
+        pWrkrData->listServerDataWkr[i]->fullUrlHealth = NULL;
+        pWrkrData->listServerDataWkr[i]->restPATH = NULL;
+        pWrkrData->listServerDataWkr[i]->lastCheck = time(NULL);
+        pWrkrData->listServerDataWkr[i]->firstInit = 0;
 
-        pWrkrData->listServerDataWk[i] = tmp_serverData;
+        DBGPRINTF("omhttp: BEGINcreateWrkrInstance : Malloc Server %d / %d \n",i , pWrkrData->pData->numServers);
+        DBGPRINTF("omhttp: BEGINcreateWrkrInstance : TIME %d\n",(int)pWrkrData->listServerDataWkr[i]->lastCheck);
     }
     initCompressCtx(pWrkrData);
     iRet = curlSetup(pWrkrData);
@@ -406,6 +414,7 @@ BEGINfreeInstance
         free(pData->listObjStats);
     }
     free(pData->statsName);
+    free(pData->lastHealthCheck);
 
    
 ENDfreeInstance
@@ -462,6 +471,7 @@ BEGINdbgPrintInstInfo
     dbgprintf("\ttemplate='%s'\n", pData->tplName);
     dbgprintf("\tnumServers=%d\n", pData->numServers);
     dbgprintf("\thealthCheckTimeout=%lu\n", pData->healthCheckTimeout);
+    dbgprintf("\thealthchecktimedelay=%lu\n", pData->healthCheckTimeDelay);
     dbgprintf("\trestPathTimeout=%lu\n", pData->restPathTimeout);
     dbgprintf("\tserverBaseUrls=");
     for (i = 0; i < pData->numServers; ++i) dbgprintf("%c'%s'", i == 0 ? '[' : ' ', pData->serverBaseUrls[i]);
@@ -600,10 +610,9 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     CURL *curl = NULL;
     CURLcode res;
     es_str_t *urlBuf = NULL;
-    serverData_s *serverData = NULL;
-    char *healthUrl;
-    char *serverUrl;
-    char *checkPath;
+    char *healthUrl = NULL;
+    char *serverUrl = NULL;
+    char *checkPath = NULL;
     int i;
     int r;
     DEFiRet;
@@ -622,10 +631,11 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     }
 
     for (i = 0; i < pWrkrData->pData->numServers; ++i) {
-
-        if(pWrkrData->listServerDataWkr[i] != NULL
-           && pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL) {
-            curl = serverData->curlCheckConnHandle;
+        // TODO : Check if curl Object contains all info
+        // resCurl = curl_easy_getinfo(serverData->curlPostHandle, CURLINFO_REQUEST_SIZE, &req);
+        if(pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL
+           && pWrkrData->listServerDataWkr[i]->fullUrlHealth != NULL) {
+            curl = pWrkrData->listServerDataWkr[i]->curlCheckConnHandle;
         }
         if (curl == NULL) {
             curl = pWrkrData->listServerDataWkr[i]->curlCheckConnHandle;
@@ -641,14 +651,18 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
                 ABORT_FINALIZE(RS_RET_SUSPENDED);
             }
 
-            curlCheckConnSetup(pWrkrData);
+            curlCheckConnSetup(pWrkrData, pWrkrData->listServerDataWkr[i]);
+
             curl_easy_setopt(curl, CURLOPT_URL, healthUrl);
 
-            if (pWrkrData->pData->dynRestPath) pWrkrData->listServerDataWkr[i]->fullUrlHealth = healthUrl;
+            pWrkrData->listServerDataWkr[i]->fullUrlHealth = (uchar *)healthUrl;
+            DBGPRINTF("omhttp: checkConn URL is : %s\n", pWrkrData->listServerDataWkr[i]->fullUrlHealth);
             pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = curl;
+            //if (healthUrl != NULL) free(healthUrl);
         }
+        DBGPRINTF("omhttp: checkConn launch request : %d\n", (i +1) );
+        DBGPRINTF("omhttp: checkConn URL is : %s\n", pWrkrData->listServerDataWkr[i]->fullUrlHealth);
         res = curl_easy_perform(curl);
-        if (healthUrl != NULL) free(healthUrl);
 
         if (res == CURLE_OK) {
             DBGPRINTF(
@@ -700,7 +714,7 @@ static rsRetVal ATTR_NONNULL(1) setPostURL(wrkrInstanceData_t *const pWrkrData, 
     int r;
     DEFiRet;
     instanceData *const pData = pWrkrData->pData;
-    serverData_s *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
+    serverData_t *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
 
     baseUrl = (char *)pData->serverBaseUrls[pWrkrData->serverIndex];
     url = es_newStrFromCStr(baseUrl, strlen(baseUrl));
@@ -730,7 +744,10 @@ static rsRetVal ATTR_NONNULL(1) setPostURL(wrkrInstanceData_t *const pWrkrData, 
     if (pWrkrData->restURL != NULL) free(pWrkrData->restURL);
 
     pWrkrData->restURL = (uchar *)es_str2cstr(url, NULL);
-    if (pData->dynRestPath) serverData->fullUrlPost = pWrkrData->restURL; // Keep URL in cache
+    if (!pData->dynRestPath) {
+        if(serverData->fullUrlPost != NULL)  free(serverData->fullUrlPost);
+        serverData->fullUrlPost = pWrkrData->restURL; // Keep URL in cache
+    }
 
     curl_easy_setopt(serverData->curlPostHandle, CURLOPT_URL, pWrkrData->restURL);
     DBGPRINTF("omhttp: using REST URL: '%s'\n", pWrkrData->restURL);
@@ -927,6 +944,7 @@ static rsRetVal checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg) {
     DEFiRet;
     CURLcode resCurl = 0;
     int indexStats = 0;
+    serverData_t *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
 
     pData = pWrkrData->pData;
     statusCode = pWrkrData->httpStatusCode;
@@ -992,11 +1010,11 @@ static rsRetVal checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg) {
         long req = 0;
         double total = 0;
         /* record total bytes */
-        resCurl = curl_easy_getinfo(pWrkrData->curlPostHandle, CURLINFO_REQUEST_SIZE, &req);
+        resCurl = curl_easy_getinfo(serverData->curlPostHandle, CURLINFO_REQUEST_SIZE, &req);
         if (!resCurl) {
             STATSCOUNTER_ADD(serverStats->httpRequestsBytes, serverStats->mutHttpRequestsBytes, (uint64_t)req);
         }
-        resCurl = curl_easy_getinfo(pWrkrData->curlPostHandle, CURLINFO_TOTAL_TIME, &total);
+        resCurl = curl_easy_getinfo(serverData->curlPostHandle, CURLINFO_TOTAL_TIME, &total);
         if (CURLE_OK == resCurl) {
             /* this needs to be converted to milliseconds */
             long total_time_ms = (long)(total * 1000);
@@ -1280,7 +1298,7 @@ finalize_it:
 static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls, const int nmsgs __attribute__((unused))) {
     CURLcode curlCode;
-    CURL *const curl = NULL;
+    CURL *curl = NULL;
     char errbuf[CURL_ERROR_SIZE] = "";
     int indexStats = pWrkrData->pData->statsBySenders ? pWrkrData->serverIndex : 0;
     char *postData;
@@ -1290,20 +1308,6 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
 
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
 
-    if (pWrkrData->pData->numServers > 1) {
-        /* needs to be called to support ES HA feature */
-        CHKiRet(checkConn(pWrkrData));
-    }
-    if(pWrkrData->listServerDataWkr[pWrkrData->serverIndex] != NULL
-       && pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle != NULL){
-        curl = pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle; 
-    } else {
-        CHKiRet(setPostURL(pWrkrData, tpls));
-        buildCurlHeaders(pWrkrData, compressed);
-        curl_easy_setopt(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle,
-                         CURLOPT_HTTPHEADER, pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader);
-    }
-
     pWrkrData->reply = NULL;
     pWrkrData->replyLen = 0;
     pWrkrData->httpStatusCode = 0;
@@ -1311,6 +1315,12 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     postData = (char *)message;
     postLen = msglen;
     compressed = 0;
+
+    if (pWrkrData->pData->numServers > 1) {
+        DBGPRINTF("omhttp: checkConn has to be done\n");
+        /* needs to be called to support ES HA feature */
+        CHKiRet(checkConn(pWrkrData));
+    }
 
     if (pWrkrData->pData->compress) {
         iRet = compressHttpPayload(pWrkrData, message, msglen);
@@ -1324,6 +1334,19 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
         }
     }
 
+    if(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle != NULL){
+        if (pWrkrData->pData->dynRestPath 
+            || pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->fullUrlPost == NULL){
+            CHKiRet(setPostURL(pWrkrData, tpls));
+        }
+    } else {
+        CHKiRet(setPostURL(pWrkrData, tpls));
+        buildCurlHeaders(pWrkrData, compressed);
+        curl_easy_setopt(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle,
+                         CURLOPT_HTTPHEADER, pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader);
+    }
+    /* Set Curl object here */
+    curl = pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle; 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postLen);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
@@ -1855,13 +1878,13 @@ static void ATTR_NONNULL() curlSetupCommon(wrkrInstanceData_t *const pWrkrData, 
     curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
 }
 
-static void ATTR_NONNULL() curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData, serverData_s *serverData) {
+static void ATTR_NONNULL() curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData) {
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     curlSetupCommon(pWrkrData, serverData->curlCheckConnHandle);
     curl_easy_setopt(serverData->curlCheckConnHandle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->healthCheckTimeout);
 }
 
-static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, serverData_s *serverData) {
+static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData) {
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     curlSetupCommon(pWrkrData, serverData->curlPostHandle);
     curl_easy_setopt(serverData->curlPostHandle, CURLOPT_POST, 1);
@@ -1879,7 +1902,7 @@ static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, s
 
 static rsRetVal ATTR_NONNULL() curlSetup(wrkrInstanceData_t *const pWrkrData) {
     struct curl_slist *slist = NULL;
-    int i;
+    int i = 0;
 
     DEFiRet;
     if (pWrkrData->pData->httpcontenttype != NULL) {
@@ -1926,7 +1949,7 @@ finalize_it:
 
 static void ATTR_NONNULL() curlCleanup(wrkrInstanceData_t *const pWrkrData) {
     for (int i = 0; i < pWrkrData->pData->numServers; i++){
-        serverData_s *serverData = pWrkrData->listServerDataWkr[i];
+        serverData_t *serverData = pWrkrData->listServerDataWkr[i];
         if (serverData->curlHeader != NULL) {
             curl_slist_free_all(serverData->curlHeader);
             serverData->curlHeader = NULL;
