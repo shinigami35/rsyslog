@@ -127,6 +127,7 @@ static uchar template_StdSplkRaw[] = "\"%rawmsg:::drop-last-lf%\n\"";
 #define SPLUNK_HEC_RESTPATH_ENDPOINT_RAW "services/collector/raw"
 #define SPLUNK_HEC_RESTPATH_ENDPOINT_HEALTH "services/collector/health"
 #define SPLUNK_HEC_HEADER_AUTH "Splunk "
+#define SPLUNK_HEC_USER_AGENT "Rsyslog-omhttp"
 
 
 /* Default batch size constants */
@@ -139,6 +140,7 @@ typedef enum vendor_e { LOKI, SPLUNK } vendor_t;
  * https://<hostName>:<restPort>/restPath
  */
 typedef struct curl_slist HEADER;
+
 typedef struct instanceConf_s {
     int defaultPort;
     int fdErrFile; /* error file fd or -1 if not open */
@@ -218,7 +220,6 @@ typedef struct serverData_s {
     uchar *fullUrlHealth; /* Keep the full url healthCheck in cache */
     uchar *restPATH; /* Keep restPath last used */
     time_t lastCheck;
-    int firstInit;
 } serverData_t;
 
 typedef struct wrkrInstanceData {
@@ -228,12 +229,12 @@ typedef struct wrkrInstanceData {
     int replyLen;
     char *reply;
     long httpStatusCode; /* http status code of response */
-    uchar *restURL; /* last used URL for error reporting */
+    //uchar *restURL; /* last used URL for error reporting */
     sbool bzInitDone;
     z_stream zstrm; /* zip stream to use for gzip http compression */
     struct {
         uchar **data; /* array of strings, this will be batched up lazily */
-        uchar *restPath; /* Helper for restpath in batch mode */
+        //uchar *restPath; /* Helper for restpath in batch mode */
         size_t sizeBytes; /* total length of this batch in bytes */
         size_t nmemb; /* number of messages in batch (for statistics counting) */
 
@@ -329,7 +330,7 @@ BEGINcreateWrkrInstance
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     pWrkrData->serverIndex = 0;
     pWrkrData->httpStatusCode = 0;
-    pWrkrData->restURL = NULL;
+    //pWrkrData->restURL = NULL;
     pWrkrData->bzInitDone = 0;
     if (pData->batchMode) {
         pWrkrData->batch.nmemb = 0;
@@ -341,7 +342,7 @@ BEGINcreateWrkrInstance
             pData->batchMode = 0; /* at least it works */
         } else {
             pWrkrData->batch.data = batchData;
-            pWrkrData->batch.restPath = NULL;
+            //pWrkrData->batch.restPath = NULL;
         }
     }
     DBGPRINTF("omhttp: BEGINcreateWrkrInstance\n");
@@ -357,10 +358,6 @@ BEGINcreateWrkrInstance
         pWrkrData->listServerDataWkr[i]->fullUrlHealth = NULL;
         pWrkrData->listServerDataWkr[i]->restPATH = NULL;
         pWrkrData->listServerDataWkr[i]->lastCheck = time(NULL);
-        pWrkrData->listServerDataWkr[i]->firstInit = 0;
-
-        DBGPRINTF("omhttp: BEGINcreateWrkrInstance : Malloc Server %d / %d \n",i , pWrkrData->pData->numServers);
-        DBGPRINTF("omhttp: BEGINcreateWrkrInstance : TIME %d\n",(int)pWrkrData->listServerDataWkr[i]->lastCheck);
     }
     initCompressCtx(pWrkrData);
     iRet = curlSetup(pWrkrData);
@@ -421,43 +418,21 @@ ENDfreeInstance
 
 BEGINfreeWrkrInstance
     CODESTARTfreeWrkrInstance;
-    curlCleanup(pWrkrData);
 
-    free(pWrkrData->restURL);
-    pWrkrData->restURL = NULL;
+    curlCleanup(pWrkrData);
+    free(pWrkrData->listServerDataWkr);
+    pWrkrData->listServerDataWkr = NULL;
+
+    /*free(pWrkrData->restURL);
+    pWrkrData->restURL = NULL;*/
 
     free(pWrkrData->batch.data);
     pWrkrData->batch.data = NULL;
 
-    if (pWrkrData->batch.restPath != NULL) {
+    /*if (pWrkrData->batch.restPath != NULL) {
         free(pWrkrData->batch.restPath);
         pWrkrData->batch.restPath = NULL;
-    }
-
-     //added
-    if (pWrkrData->listServerDataWkr != NULL){
-        for (int i = 0; i < pWrkrData->pData->numServers; i++){
-            if (pWrkrData->listServerDataWkr[i]->curlHeader != NULL) {
-                curl_slist_free_all(pWrkrData->listServerDataWkr[i]->curlHeader);
-                pWrkrData->listServerDataWkr[i]->curlHeader = NULL;
-            }
-            if (pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL) {
-                curl_easy_cleanup(pWrkrData->listServerDataWkr[i]->curlCheckConnHandle);
-                pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = NULL;
-            }
-            if (pWrkrData->listServerDataWkr[i]->curlPostHandle != NULL) {
-                curl_easy_cleanup(pWrkrData->listServerDataWkr[i]->curlPostHandle);
-                pWrkrData->listServerDataWkr[i]->curlPostHandle = NULL;
-            }
-            if(pWrkrData->listServerDataWkr[i]->fullUrlPost) free(pWrkrData->listServerDataWkr[i]->fullUrlPost);
-            if(pWrkrData->listServerDataWkr[i]->fullUrlHealth) free(pWrkrData->listServerDataWkr[i]->fullUrlHealth);
-            if(pWrkrData->listServerDataWkr[i]->restPATH) free(pWrkrData->listServerDataWkr[i]->restPATH);
-
-            pWrkrData->listServerDataWkr[i] = NULL;   
-        }
-        free(pWrkrData->listServerDataWkr);
-        pWrkrData->listServerDataWkr = NULL;
-    }
+    }*/
 
     if (pWrkrData->bzInitDone) deflateEnd(&pWrkrData->zstrm);
     freeCompressCtx(pWrkrData);
@@ -697,7 +672,6 @@ ENDtryResume
 
 /* get the current rest path for this message */
 static void ATTR_NONNULL(1) getRestPath(const instanceData *const pData, uchar **const tpls, uchar **const restPath) {
-    *restPath = pData->restPath;
     if (pData->dynRestPath && tpls != NULL) {
         *restPath = tpls[1];
     }
@@ -716,41 +690,40 @@ static rsRetVal ATTR_NONNULL(1) setPostURL(wrkrInstanceData_t *const pWrkrData, 
     instanceData *const pData = pWrkrData->pData;
     serverData_t *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
 
-    baseUrl = (char *)pData->serverBaseUrls[pWrkrData->serverIndex];
-    url = es_newStrFromCStr(baseUrl, strlen(baseUrl));
-    if (url == NULL) {
-        LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: error allocating new estr for POST url.");
-        ABORT_FINALIZE(RS_RET_ERR);
-    }
+    if(pData->dynRestPath || serverData->fullUrlPost == NULL){
+        
+        baseUrl = (char *)pData->serverBaseUrls[pWrkrData->serverIndex];
+        url = es_newStrFromCStr(baseUrl, strlen(baseUrl));
+        if (url == NULL) {
+            LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: error allocating new estr for POST url.");
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
 
-    if (pWrkrData->batch.restPath != NULL) {
-        /* get from batch if set! */
-        restPath = pWrkrData->batch.restPath;
-    } else {
-        getRestPath(pData, tpls, &restPath);
-    }
+        if (serverData->restPATH != NULL) {
+            /* get from batch if set! */
+            restPath = serverData->restPATH ;
+        } else {
+            restPath = pData->restPath;
+            getRestPath(pData, tpls, &restPath);
+        }
 
-    r = 0;
-    if (restPath != NULL) r = es_addBuf(&url, (char *)restPath, ustrlen(restPath));
+        r = 0;
+        if (restPath != NULL) r = es_addBuf(&url, (char *)restPath, ustrlen(restPath));
 
-    if (r != 0) {
-        LogError(0, RS_RET_ERR,
-                 "omhttp: failure in creating restURL, "
-                 "error code: %d",
-                 r);
-        ABORT_FINALIZE(RS_RET_ERR);
-    }
+        if (r != 0) {
+            LogError(0, RS_RET_ERR,
+                    "omhttp: failure in creating restURL, "
+                    "error code: %d",
+                    r);
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
 
-    if (pWrkrData->restURL != NULL) free(pWrkrData->restURL);
-
-    pWrkrData->restURL = (uchar *)es_str2cstr(url, NULL);
-    if (!pData->dynRestPath) {
         if(serverData->fullUrlPost != NULL)  free(serverData->fullUrlPost);
-        serverData->fullUrlPost = pWrkrData->restURL; // Keep URL in cache
+        serverData->fullUrlPost = (uchar *)es_str2cstr(url, NULL);
     }
 
-    curl_easy_setopt(serverData->curlPostHandle, CURLOPT_URL, pWrkrData->restURL);
-    DBGPRINTF("omhttp: using REST URL: '%s'\n", pWrkrData->restURL);
+    curl_easy_setopt(serverData->curlPostHandle, CURLOPT_URL, serverData->fullUrlPost);
+    DBGPRINTF("omhttp: using REST URL: '%s'\n", serverData->fullUrlPost);
 
 finalize_it:
     if (url != NULL) es_deleteStr(url);
@@ -773,9 +746,10 @@ static rsRetVal renderJsonErrorMessage(wrkrInstanceData_t *pWrkrData, uchar *req
     fjson_object *req = NULL;
     fjson_object *res = NULL;
     fjson_object *errRoot = NULL;
+    uchar *url = pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->fullUrlPost;
 
     if ((req = fjson_object_new_object()) == NULL) ABORT_FINALIZE(RS_RET_ERR);
-    fjson_object_object_add(req, "url", fjson_object_new_string((char *)pWrkrData->restURL));
+    fjson_object_object_add(req, "url", fjson_object_new_string((char *)url));
     fjson_object_object_add(req, "postdata", fjson_object_new_string((char *)reqmsg));
 
     if ((res = fjson_object_new_object()) == NULL) {
@@ -1035,15 +1009,6 @@ static rsRetVal checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg) {
         if (bMatch) {
             /* Force retry for explicitly configured codes */
             iRet = RS_RET_SUSPENDED;
-
-            /* HEC:SPLUNK
-             * If receive code 503
-             * The HEC server can be full
-             * Retry data to an other HEC if more than 1 HEC is set up
-             */
-            if (pData->vendor == SPLUNK && pData->numServers > 1 && statusCode == 503) {
-                incrementServerIndex(pWrkrData);
-            }
         }
     }
 
@@ -1282,6 +1247,7 @@ static rsRetVal ATTR_NONNULL() buildCurlHeaders(wrkrInstanceData_t *pWrkrData, s
 
     if (pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader != NULL){
         curl_slist_free_all(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader);
+        pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader = NULL;
     } 
 
     pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader = slist;
@@ -1301,6 +1267,7 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     CURL *curl = NULL;
     char errbuf[CURL_ERROR_SIZE] = "";
     int indexStats = pWrkrData->pData->statsBySenders ? pWrkrData->serverIndex : 0;
+    serverData_t *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
     char *postData;
     int postLen;
     sbool compressed;
@@ -1334,19 +1301,17 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
         }
     }
 
-    if(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle != NULL){
-        if (pWrkrData->pData->dynRestPath 
-            || pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->fullUrlPost == NULL){
-            CHKiRet(setPostURL(pWrkrData, tpls));
-        }
-    } else {
+    if (pWrkrData->pData->dynRestPath || serverData->fullUrlPost == NULL){
         CHKiRet(setPostURL(pWrkrData, tpls));
-        buildCurlHeaders(pWrkrData, compressed);
-        curl_easy_setopt(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle,
-                         CURLOPT_HTTPHEADER, pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader);
+
+        if(serverData->curlHeader == NULL) {
+            buildCurlHeaders(pWrkrData, compressed);
+            curl_easy_setopt(serverData->curlPostHandle, CURLOPT_HTTPHEADER, serverData->curlHeader);
+        }
     }
+    
     /* Set Curl object here */
-    curl = pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlPostHandle; 
+    curl = serverData->curlPostHandle; 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postLen);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
@@ -1369,6 +1334,7 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     } else {
         STATSCOUNTER_INC(pWrkrData->pData->listObjStats[indexStats].ctrHttpRequestSuccess,
                          pWrkrData->pData->listObjStats[indexStats].mutCtrHttpRequestSuccess);
+        serverData->curlPostHandle = curl;
     }
 
     // Grab the HTTP Response code
@@ -1643,10 +1609,10 @@ static inline size_t computeDeltaExtraOnAppend(const wrkrInstanceData_t *pWrkrDa
 static void ATTR_NONNULL() initializeBatch(wrkrInstanceData_t *pWrkrData) {
     pWrkrData->batch.sizeBytes = 0;
     pWrkrData->batch.nmemb = 0;
-    if (pWrkrData->batch.restPath != NULL) {
+    /*if (pWrkrData->batch.restPath != NULL) {
         free(pWrkrData->batch.restPath);
         pWrkrData->batch.restPath = NULL;
-    }
+    }*/
 }
 
 /* Adds a message to this worker's batch
@@ -1723,6 +1689,8 @@ BEGINcommitTransaction
     for (i = 0; i < nParams; ++i) {
         uchar *payload = actParam(pParams, iNumTpls, i, 0).param;
         uchar *tpls[2] = {payload, NULL};
+        serverData_t *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
+
         if (iNumTpls == 2) tpls[1] = actParam(pParams, iNumTpls, i, 1).param;
 
         STATSCOUNTER_INC(pWrkrData->pData->listObjStats[indexStats].ctrMessagesSubmitted,
@@ -1731,15 +1699,15 @@ BEGINcommitTransaction
         if (pData->batchMode) {
             if (pData->dynRestPath) {
                 uchar *restPath = actParam(pParams, iNumTpls, i, 1).param;
-                if (pWrkrData->batch.restPath == NULL) {
-                    CHKmalloc(pWrkrData->batch.restPath = (uchar *)strdup((char *)restPath));
-                } else if (strcmp((char *)pWrkrData->batch.restPath, (char *)restPath) != 0) {
+                if (serverData->restPATH == NULL) {
+                    CHKmalloc(serverData->restPATH = (uchar *)strdup((char *)restPath));
+                } else if (strcmp((char *)serverData->restPATH, (char *)restPath) != 0) {
                     /* restPath changed -> flush current batch if it contains data */
                     if (pWrkrData->batch.nmemb > 0) {
                         CHKiRet(submitBatch(pWrkrData, NULL));
                     }
                     initializeBatch(pWrkrData);
-                    CHKmalloc(pWrkrData->batch.restPath = (uchar *)strdup((char *)restPath));
+                    CHKmalloc(serverData->restPATH = (uchar *)strdup((char *)restPath));
                 }
             }
 
@@ -1773,10 +1741,14 @@ BEGINcommitTransaction
                 initializeBatch(pWrkrData);
                 if (pData->dynRestPath) {
                     uchar *restPath = actParam(pParams, iNumTpls, i, 1).param;
-                    CHKmalloc(pWrkrData->batch.restPath = (uchar *)strdup((char *)restPath));
+                    // batch send so index server change
+                    serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
+                    if(serverData->restPATH == NULL
+                       || strcmp((char *)serverData->restPATH, (char *)restPath) != 0){
+                        CHKmalloc(serverData->restPATH = (uchar *)strdup((char *)restPath));
+                    }
                 }
             }
-
             CHKiRet(buildBatch(pWrkrData, payload));
         } else {
             /* non-batch mode: send immediately */
@@ -1851,6 +1823,7 @@ finalize_it:
 
 static void ATTR_NONNULL() curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle) {
     instanceData *const pData = pWrkrData->pData;
+    CURLcode cRet;
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader);
     curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
@@ -1874,6 +1847,17 @@ static void ATTR_NONNULL() curlSetupCommon(wrkrInstanceData_t *const pWrkrData, 
     if (pData->caCertFile) curl_easy_setopt(handle, CURLOPT_CAINFO, pData->caCertFile);
     if (pData->myCertFile) curl_easy_setopt(handle, CURLOPT_SSLCERT, pData->myCertFile);
     if (pData->myPrivKeyFile) curl_easy_setopt(handle, CURLOPT_SSLKEY, pData->myPrivKeyFile);
+
+    /* Set up a user-agent for HTTP keep alive working with Splunk HEC */
+    if(pData->vendor == SPLUNK){
+        cRet = curl_easy_setopt(handle, CURLOPT_USERAGENT, SPLUNK_HEC_USER_AGENT);
+        if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlSetupCommon unknown option CURLOPT_USERAGENT\n");
+    }
+    /* Force Cache session for SSL */
+    if(pData->useHttps){
+        cRet = curl_easy_setopt(handle, CURLOPT_SSL_SESSIONID_CACHE, 1L);
+        if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlSetupCommon unknown option CURLOPT_SSL_SESSIONID_CACHE\n");
+    }
     /* uncomment for in-dept debuggung:
     curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
 }
@@ -1881,7 +1865,7 @@ static void ATTR_NONNULL() curlSetupCommon(wrkrInstanceData_t *const pWrkrData, 
 static void ATTR_NONNULL() curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData) {
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     curlSetupCommon(pWrkrData, serverData->curlCheckConnHandle);
-    curl_easy_setopt(serverData->curlCheckConnHandle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->healthCheckTimeout);
+    curl_easy_setopt(serverData->curlCheckConnHandle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->healthCheckTimeout);  
 }
 
 static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData) {
@@ -1898,41 +1882,49 @@ static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, s
     /* interval time between keep-alive probes: 60 seconds */
     cRet = curl_easy_setopt(serverData->curlPostHandle, CURLOPT_TCP_KEEPINTVL, 60L);
     if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlPostSetup unknown option CURLOPT_TCP_KEEPINTVL\n");
+
+    cRet = curl_easy_setopt(serverData->curlPostHandle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlPostSetup unknown option CURLOPT_HTTP_VERSION\n");
 }
 
 static rsRetVal ATTR_NONNULL() curlSetup(wrkrInstanceData_t *const pWrkrData) {
-    struct curl_slist *slist = NULL;
+    struct curl_slist *slist;
     int i = 0;
 
     DEFiRet;
-    if (pWrkrData->pData->httpcontenttype != NULL) {
-        slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerContentTypeBuf);
-    } else {
-        slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
-    }
-
-    if (pWrkrData->pData->headerBuf != NULL) {
-        slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerBuf);
-        CHKmalloc(slist);
-    }
-
-    for (int k = 0; k < pWrkrData->pData->nHttpHeaders; k++) {
-        slist = curl_slist_append(slist, (char *)pWrkrData->pData->httpHeaders[k]);
-        CHKmalloc(slist);
-    }
-
-    // When sending more than 1Kb, libcurl automatically sends an Except: 100-Continue header
-    // and will wait 1s for a response, could make this configurable but for now disable
-    slist = curl_slist_append(slist, HTTP_HEADER_EXPECT_EMPTY);
     for (i = 0; i < pWrkrData->pData->numServers; i++){
+        slist = NULL;
+        if (pWrkrData->pData->httpcontenttype != NULL) {
+            slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerContentTypeBuf);
+        } else {
+            slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+        }
+
+        if (pWrkrData->pData->headerBuf != NULL) {
+            slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerBuf);
+            CHKmalloc(slist);
+        }
+
+        for (int k = 0; k < pWrkrData->pData->nHttpHeaders; k++) {
+            slist = curl_slist_append(slist, (char *)pWrkrData->pData->httpHeaders[k]);
+            CHKmalloc(slist);
+        }
+
+        // When sending more than 1Kb, libcurl automatically sends an Except: 100-Continue header
+        // and will wait 1s for a response, could make this configurable but for now disable
+        slist = curl_slist_append(slist, HTTP_HEADER_EXPECT_EMPTY);
+
+       /* Create Curl Handle for each destination server */
+        pWrkrData->listServerDataWkr[i]->curlHeader = slist;
         CHKmalloc(pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = curl_easy_init());
         CHKmalloc(pWrkrData->listServerDataWkr[i]->curlPostHandle = curl_easy_init());
-        pWrkrData->listServerDataWkr[i]->curlHeader = slist;
         curlPostSetup(pWrkrData, pWrkrData->listServerDataWkr[i]);
         curlCheckConnSetup(pWrkrData, pWrkrData->listServerDataWkr[i]);
     }
 finalize_it:
     if (iRet != RS_RET_OK) {
+        if (slist != NULL) curl_slist_free_all(slist);
+        
         for(int j = 0; j < i; j++) {
             if (pWrkrData->listServerDataWkr[j]->curlPostHandle != NULL){
                 curl_easy_cleanup(pWrkrData->listServerDataWkr[j]->curlPostHandle);
@@ -1942,28 +1934,45 @@ finalize_it:
                 curl_easy_cleanup(pWrkrData->listServerDataWkr[j]->curlCheckConnHandle);
                 pWrkrData->listServerDataWkr[j]->curlCheckConnHandle = NULL;
             }
+            if (pWrkrData->listServerDataWkr[j]->curlHeader != NULL){
+                curl_slist_free_all(pWrkrData->listServerDataWkr[j]->curlHeader);
+                pWrkrData->listServerDataWkr[j]->curlHeader = NULL;
+            }
         }
     }
     RETiRet;
 }
 
 static void ATTR_NONNULL() curlCleanup(wrkrInstanceData_t *const pWrkrData) {
-    for (int i = 0; i < pWrkrData->pData->numServers; i++){
-        serverData_t *serverData = pWrkrData->listServerDataWkr[i];
-        if (serverData->curlHeader != NULL) {
-            curl_slist_free_all(serverData->curlHeader);
-            serverData->curlHeader = NULL;
-        }
-        if (serverData->curlCheckConnHandle != NULL) {
-            curl_easy_cleanup(serverData->curlCheckConnHandle);
-            serverData->curlCheckConnHandle = NULL;
-        }
-        if (serverData->curlPostHandle != NULL) {
-            curl_easy_cleanup(serverData->curlPostHandle);
-            serverData->curlPostHandle = NULL;
+    int size = pWrkrData->pData->numServers;
+    if (pWrkrData->listServerDataWkr != NULL){
+        for (int i = 0; i < size; i++){
+            if (pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL) {
+                curl_easy_cleanup(pWrkrData->listServerDataWkr[i]->curlCheckConnHandle);
+                pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = NULL;
+            }
+            if (pWrkrData->listServerDataWkr[i]->curlPostHandle != NULL) {
+                curl_easy_cleanup(pWrkrData->listServerDataWkr[i]->curlPostHandle);
+                pWrkrData->listServerDataWkr[i]->curlPostHandle = NULL;
+            }
+            if(pWrkrData->listServerDataWkr[i]->fullUrlPost != NULL) {
+                free(pWrkrData->listServerDataWkr[i]->fullUrlPost);
+            }
+            if(pWrkrData->listServerDataWkr[i]->fullUrlHealth != NULL) {
+                free(pWrkrData->listServerDataWkr[i]->fullUrlHealth);
+            }
+            if(pWrkrData->listServerDataWkr[i]->restPATH != NULL) {
+                free(pWrkrData->listServerDataWkr[i]->restPATH);
+            }
+
+            if (pWrkrData->listServerDataWkr[i]->curlHeader != NULL) {
+                curl_slist_free_all(pWrkrData->listServerDataWkr[i]->curlHeader);
+                pWrkrData->listServerDataWkr[i]->curlHeader = NULL;
+            }
+
+            pWrkrData->listServerDataWkr[i] = NULL;
         }
     }
-    
 }
 
 static void ATTR_NONNULL() setInstParamDefaults(instanceData *const pData) {
@@ -2131,7 +2140,6 @@ static rsRetVal applyProfileSettings(instanceData *const pData, const char *cons
                 LogError(0, RS_RET_PARAM_ERROR, "omhttp: unknown Splunk HEC endpoint '%s' in profile", endpoint);
                 ABORT_FINALIZE(RS_RET_PARAM_ERROR);
             }
-
             /* Header */
             if (pData->token != NULL) {
                 /* Create authorization header */
@@ -2146,8 +2154,8 @@ static rsRetVal applyProfileSettings(instanceData *const pData, const char *cons
                     LogError(0, RS_RET_ERR, "omhttp: error occurred computing token");
                     ABORT_FINALIZE(RS_RET_ERR);
                 }
-
-                if (pData->nHttpHeaders > 0) {
+                // Correction of code 
+                if (pData->nHttpHeaders == 0) {
                     CHKmalloc(pData->httpHeaders = malloc(sizeof(uchar *) * 1));  // Only one HEADER
                     pData->nHttpHeaders = 1;
                     pData->httpHeaders[0] = (uchar *)es_str2cstr(tmpHeader, NULL);
@@ -2158,8 +2166,9 @@ static rsRetVal applyProfileSettings(instanceData *const pData, const char *cons
                         es_deleteStr(tmpHeader);
                         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
                     }
+                    
                     pData->httpHeaders[pData->nHttpHeaders] = (uchar *)es_str2cstr(tmpHeader, NULL);
-                    pData->nHttpHeaders++;
+                    pData->nHttpHeaders += 1;
                 }
                 if (tmpHeader != NULL) es_deleteStr(tmpHeader);
             } else {
