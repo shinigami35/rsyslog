@@ -380,7 +380,7 @@ BEGINcreateWrkrInstance
         pWrkrData->listServerDataWkr[i]->fullUrlPost = NULL;
         pWrkrData->listServerDataWkr[i]->fullUrlHealth = NULL;
         pWrkrData->listServerDataWkr[i]->restPATH = NULL;
-        pWrkrData->listServerDataWkr[i]->lastCheck = time(NULL);
+        pWrkrData->listServerDataWkr[i]->lastCheck = 0; // to avoid first check to be postponed
     }
     initCompressCtx(pWrkrData);
     iRet = curlSetup(pWrkrData);
@@ -781,6 +781,7 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 			}
             server->fullUrlHealth = (uchar *)healthUrl;
+            free(healthUrl);
         }
 		
 		curl_easy_setopt(server->curlCheckConnHandle, CURLOPT_URL, (char *)server->fullUrlHealth);
@@ -821,6 +822,7 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 
 finalize_it:
 	if (urlBuf != NULL) es_deleteStr(urlBuf);
+    if (healthUrl != NULL) free(healthUrl);
     RETiRet;
 }
 
