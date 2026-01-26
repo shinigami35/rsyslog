@@ -205,6 +205,9 @@ static rsRetVal addListener(instanceConf_t *iconf) {
 
     switch (iconf->sockType) {
         case ZMQ_SUB:
+/* ZMQ_DISH socket type is available and stable in all czmq versions that
+ * define it. The previous version restriction (< 4.2.0) was incorrect and
+ * has been removed. */
 #if defined(ZMQ_DISH)
         case ZMQ_DISH:
 #endif
@@ -243,6 +246,7 @@ static rsRetVal addListener(instanceConf_t *iconf) {
             if (iconf->sockType == ZMQ_SUB) {
                 zsock_set_subscribe(pData->sock, topic);
             }
+/* ZMQ_DISH socket type support - available in all czmq versions that define it */
 #if defined(ZMQ_DISH)
             else if (iconf->sockType == ZMQ_DISH) {
                 int rc = zsock_join(pData->sock, topic);
@@ -594,6 +598,7 @@ BEGINnewInpInst
             else if (!strcmp("SUB", stringType)) {
                 inst->sockType = ZMQ_SUB;
             }
+/* ZMQ_DISH socket type support - available in all czmq versions that define it */
 #if defined(ZMQ_DISH)
             else if (!strcmp("DISH", stringType)) {
                 inst->sockType = ZMQ_DISH;

@@ -3,7 +3,7 @@
  * because it was either written from scratch by me (rgerhards) or
  * contributors who agreed to ASL 2.0.
  *
- * Copyright 2004-2024 Rainer Gerhards and Adiscon
+ * Copyright 2004-2026 Rainer Gerhards and Adiscon
  *
  * This file is part of rsyslog.
  *
@@ -30,6 +30,8 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <string.h>
 #ifdef ENABLE_LIBLOGGING_STDLOG
     #include <liblogging/stdlog.h>
 #else
@@ -62,6 +64,7 @@
 #include "glbl.h"
 #include "debug.h"
 #include "srUtils.h"
+#include "rainerscript.h"
 #include "rsconf.h"
 #include "cfsysline.h"
 #include "datetime.h"
@@ -270,11 +273,47 @@ finalize_it:
     RETiRet;
 }
 
+static void syncPidFileDir(const char *pidFilePath) {
+    const char *slash = strrchr(pidFilePath, '/');
+    char *dirPath = NULL;
+    int dirfd = -1;
+
+    if (slash == NULL) {
+        dirPath = strdup(".");
+    } else if (slash == pidFilePath) {
+        dirPath = strdup("/");
+    } else {
+        dirPath = strndup(pidFilePath, slash - pidFilePath);
+    }
+
+    if (dirPath == NULL) {
+        DBGPRINTF("rsyslogd: out of memory syncing pidfile directory\n");
+        return;
+    }
+
+    dirfd = open(dirPath, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (dirfd == -1) {
+        DBGPRINTF("rsyslogd: error opening pidfile directory '%s' for sync\n", dirPath);
+        goto finalize_it;
+    }
+
+    if (fsync(dirfd) != 0) {
+        DBGPRINTF("rsyslogd: error syncing pidfile directory '%s'\n", dirPath);
+    }
+
+finalize_it:
+    if (dirfd != -1) {
+        close(dirfd);
+    }
+    free(dirPath);
+}
+
 static rsRetVal writePidFile(void) {
-    FILE *fp;
+    FILE *fp = NULL;
     DEFiRet;
 
     const char *tmpPidFile = NULL;
+    int fd = -1;
 
     if (!strcmp(PidFile, NO_PIDFILE)) {
         FINALIZE;
@@ -282,7 +321,6 @@ static rsRetVal writePidFile(void) {
     if (asprintf((char **)&tmpPidFile, "%s.tmp", PidFile) == -1) {
         ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     }
-    if (tmpPidFile == NULL) tmpPidFile = PidFile;
 
     DBGPRINTF("rsyslogd: writing pidfile '%s'.\n", tmpPidFile);
     if ((fp = fopen((char *)tmpPidFile, "w")) == NULL) {
@@ -290,16 +328,43 @@ static rsRetVal writePidFile(void) {
         ABORT_FINALIZE(RS_RET_ERR);
     }
     if (fprintf(fp, "%d", (int)glblGetOurPid()) < 0) {
-        LogError(errno, iRet, "rsyslog: error writing pid file");
+        perror("rsyslogd: error writing pid file");
+        ABORT_FINALIZE(RS_RET_ERR);
     }
-    fclose(fp);
+    if (fflush(fp) != 0) {
+        perror("rsyslogd: error flushing pid file");
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+    fd = fileno(fp);
+    if (fd == -1) {
+        perror("rsyslogd: error obtaining pid file descriptor");
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+    if (fsync(fd) != 0) {
+        perror("rsyslogd: error syncing pid file");
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+    if (fclose(fp) != 0) {
+        fp = NULL;
+        perror("rsyslogd: error closing pid file");
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+    fp = NULL;
     if (tmpPidFile != PidFile) {
         if (rename(tmpPidFile, PidFile) != 0) {
             perror("rsyslogd: error writing pid file (rename stage)");
+            ABORT_FINALIZE(RS_RET_ERR);
         }
+        syncPidFileDir(PidFile);
     }
 
 finalize_it:
+    if (iRet != RS_RET_OK && tmpPidFile != NULL && tmpPidFile != PidFile) {
+        unlink(tmpPidFile);
+    }
+    if (fp != NULL) {
+        fclose(fp);
+    }
     if (tmpPidFile != PidFile) {
         free((void *)tmpPidFile);
     }
@@ -733,11 +798,18 @@ finalize_it:
 }
 
 
-/* The consumer of dequeued messages. This function is called by the
- * queue engine on dequeueing of a message. It runs on a SEPARATE
- * THREAD. It receives an array of pointers, which it must iterate
- * over. We do not do any further batching, as this is of no benefit
- * for the main queue.
+/**
+ * @brief Message Consumer (Worker Thread).
+ *
+ * This function runs on a **separate thread** as part of the Queue Worker Pool.
+ * It consumes a batch of messages dequeued from the main message queue.
+ *
+ * @note No further batching is performed here, as optimization happens in `preprocessBatch`.
+ *
+ * @param notNeeded Unused argument (required for thread signature).
+ * @param pBatch Pointer to the batch of messages to process.
+ * @param pWti Pointer to the Worker Thread Instance (WTI) data.
+ * @return RS_RET_OK on success.
  */
 static rsRetVal msgConsumer(void __attribute__((unused)) * notNeeded, batch_t *pBatch, wti_t *pWti) {
     DEFiRet;
@@ -762,9 +834,32 @@ static rsRetVal msgConsumer(void __attribute__((unused)) * notNeeded, batch_t *p
 rsRetVal createMainQueue(qqueue_t **ppQueue, uchar *pszQueueName, struct nvlst *lst) {
     struct queuefilenames_s *qfn;
     uchar *qfname = NULL;
+    uchar *queueName = pszQueueName;
+    uchar *queueNameOverride = NULL;
     static int qfn_renamenum = 0;
     uchar qfrenamebuf[1024];
     DEFiRet;
+
+    if (lst != NULL) {
+        static struct cnfparamdescr mainqdescr[] = {{"name", eCmdHdlrString, 0}};
+        static struct cnfparamblk mainqpblk = {CNFPARAMBLK_VERSION, sizeof(mainqdescr) / sizeof(mainqdescr[0]),
+                                               mainqdescr};
+        struct cnfparamvals *pvals;
+        int nameIdx;
+
+        pvals = nvlstGetParams(lst, &mainqpblk, NULL);
+        if (pvals == NULL) {
+            ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+        }
+        nameIdx = cnfparamGetIdx(&mainqpblk, "name");
+        if (nameIdx != -1 && pvals[nameIdx].bUsed) {
+            queueNameOverride = (uchar *)es_str2cstr(pvals[nameIdx].val.d.estr, NULL);
+            if (queueNameOverride != NULL && queueNameOverride[0] != '\0') {
+                queueName = queueNameOverride;
+            }
+        }
+        cnfparamvalsDestruct(pvals, &mainqpblk);
+    }
 
     /* create message queue */
     CHKiRet_Hdlr(qqueueConstruct(ppQueue, ourConf->globals.mainQ.MainMsgQueType,
@@ -774,7 +869,7 @@ rsRetVal createMainQueue(qqueue_t **ppQueue, uchar *pszQueueName, struct nvlst *
         LogError(0, iRet, "could not create (ruleset) main message queue");
     }
     /* name our main queue object (it's not fatal if it fails...) */
-    obj.SetName((obj_t *)(*ppQueue), pszQueueName);
+    obj.SetName((obj_t *)(*ppQueue), queueName);
 
     if (lst == NULL) { /* use legacy parameters? */
         /* ... set some properties ... */
@@ -802,7 +897,7 @@ rsRetVal createMainQueue(qqueue_t **ppQueue, uchar *pszQueueName, struct nvlst *
                 if (!ustrcmp(qfn->name, ourConf->globals.mainQ.pszMainMsgQFName)) {
                     snprintf((char *)qfrenamebuf, sizeof(qfrenamebuf), "%d-%s-%s", ++qfn_renamenum,
                              ourConf->globals.mainQ.pszMainMsgQFName,
-                             (pszQueueName == NULL) ? "NONAME" : (char *)pszQueueName);
+                             (queueName == NULL) ? "NONAME" : (char *)queueName);
                     qfname = ustrdup(qfrenamebuf);
                     LogError(0, NO_ERRCODE,
                              "Error: queue file name '%s' already in use "
@@ -855,6 +950,8 @@ rsRetVal createMainQueue(qqueue_t **ppQueue, uchar *pszQueueName, struct nvlst *
     }
     qqueueCorrectParams(*ppQueue);
 
+finalize_it:
+    free(queueNameOverride);
     RETiRet;
 }
 
@@ -1086,9 +1183,14 @@ finalize_it:
 }
 
 
-/* submit a message to the main message queue.   This is primarily
- * a hook to prevent the need for callers to know about the main message queue
- * rgerhards, 2008-02-13
+/**
+ * @brief Submit a message to the Main Message Queue (Wrapper).
+ *
+ * A helper function that abstracts the main message queue details from callers.
+ * It is commonly used by plugins to inject messages into the processing pipeline.
+ *
+ * @param pMsg The message object to submit.
+ * @return RS_RET_OK on success.
  */
 rsRetVal submitMsg2(smsg_t *pMsg) {
     qqueue_t *pQueue;
@@ -1328,16 +1430,18 @@ static void initAll(int argc, char **argv) {
     hdlr_enable(SIGTTIN, hdlr_sigttin_ou);
     hdlr_enable(SIGTTOU, hdlr_sigttin_ou);
 
-    /* first, parse the command line options. We do not carry out any actual work, just
-     * see what we should do. This relieves us from certain anomalies and we can process
-     * the parameters down below in the correct order. For example, we must know the
-     * value of -M before we can do the init, but at the same time we need to have
-     * the base classes init before we can process most of the options. Now, with the
-     * split of functionality, this is no longer a problem. Thanks to varmofekoj for
-     * suggesting this algo.
-     * Note: where we just need to set some flags and can do so without knowledge
-     * of other options, we do this during the inital option processing.
-     * rgerhards, 2008-04-04
+    /*
+     * Command-line option parser (Pass 1).
+     *
+     * Parses command-line options to determine the operating mode and set initial flags.
+     *
+     * This block implements a "two-pass" strategy:
+     * 1. Immediate flags: Options like debug (`-d`) or no-fork (`-n`) are set immediately.
+     * 2. Deferred arguments: Complex options are buffered into a list (`bufOptAdd`)
+     *    to be processed later by `processStartupOptions`.
+     *
+     * This separation allows rsyslog to set up the runtime environment (like debug logging)
+     * before processing complex configurations that might depend on it.
      */
 #if defined(_AIX)
     while ((ch = getopt(argc, argv, "46ACDdf:hi:M:nN:o:qQS:T:u:vwxR")) != EOF) {
@@ -1798,6 +1902,7 @@ void processImInternal(void) {
     smsg_t *pMsg;
     smsg_t *repMsg;
 
+    assert(internalMsg_ratelimiter != NULL);
     while (iminternalRemoveMsg(&pMsg) == RS_RET_OK) {
         rsRetVal localRet = ratelimitMsg(internalMsg_ratelimiter, pMsg, &repMsg);
         if (repMsg != NULL) {
@@ -1810,11 +1915,26 @@ void processImInternal(void) {
 }
 
 
-/* This takes a received message that must be decoded and submits it to
- * the main message queue. This is a legacy function which is being provided
- * to aid older input plugins that do not support message creation via
- * the new interfaces themselves. It is not recommended to use this
- * function for new plugins. -- rgerhards, 2009-10-12
+/**
+ * @brief Parse and submit a raw message to the main queue (Legacy).
+ *
+ * Decodes a received message and submits it to the main message queue.
+ *
+ * @note **Legacy Function**: This function is provided to support older input plugins that
+ * do not support message creation via the new message interfaces.
+ * **NEW PLUGINS SHOULD NOT USE THIS FUNCTION.**
+ *
+ * @param hname Hostname of the sender.
+ * @param hnameIP IP address of the sender.
+ * @param msg The raw message content.
+ * @param len Length of the message content.
+ * @param flags Message flags.
+ * @param flowCtlType Type of flow control to apply.
+ * @param pInputName Name of the input module.
+ * @param stTime Syslog time stamp.
+ * @param ttGenTime Time the message was generated.
+ * @param pRuleset Ruleset to apply to this message.
+ * @return RS_RET_OK on success.
  */
 rsRetVal parseAndSubmitMessage(const uchar *const hname,
                                const uchar *const hnameIP,
@@ -1861,7 +1981,6 @@ finalize_it:
 
 /* helper to doHUP(), this "HUPs" each action. The necessary locking
  * is done inside the action class and nothing we need to take care of.
- * rgerhards, 2008-10-22
  */
 DEFFUNC_llExecFunc(doHUPActions) {
     actionCallHUPHdlr((action_t *)pData);
@@ -1869,15 +1988,23 @@ DEFFUNC_llExecFunc(doHUPActions) {
 }
 
 
-/* This function processes a HUP after one has been detected. Note that this
- * is *NOT* the sighup handler. The signal is recorded by the handler, that record
- * detected inside the mainloop and then this function is called to do the
- * real work. -- rgerhards, 2008-10-22
- * Note: there is a VERY slim chance of a data race when the hostname is reset.
+/** Processes a HUP after detection in the main loop.
+ *
+ * @brief Handles SIGHUP signal logic.
+ *
+ * @note This function is *called* by the main loop after a signal handler
+ * detected SIGHUP. It is NOT the signal handler itself.
+ *
+ * @note This function **DOES NOT** reload the main configuration (rsyslog.conf).
+ * It is primarily used for **Log Rotation** (closing/reopening output files)
+ * and notifying modules to refresh internal state (like lookup tables).
+ * To reload configuration, a restart is required.
+ *
+ * There is a VERY slim chance of a data race when the hostname is reset.
  * We prefer to take this risk rather than sync all accesses, because to the best
  * of my analysis it can not really hurt (the actual property is reference-counted)
  * but the sync would require some extra CPU for *each* message processed.
- * rgerhards, 2012-04-11
+ * -- rgerhards, 2008-10-22 / 2012-04-11
  */
 static void doHUP(void) {
     char buf[512];
@@ -1902,18 +2029,20 @@ static void doHUP(void) {
     errmsgDoHUP();
 }
 
-/* rsyslogdDoDie() is a signal handler. If called, it sets the bFinished variable
- * to indicate the program should terminate. However, it does not terminate
- * it itself, because that causes issues with multi-threading. The actual
- * termination is then done on the main thread. This solution might introduce
- * a minimal delay, but it is much cleaner than the approach of doing everything
- * inside the signal handler.
- * rgerhards, 2005-10-26
- * Note:
- * - we do not call DBGPRINTF() as this may cause us to block in case something
- *   with the threading is wrong.
- * - we do not really care about the return state of write(), but we need this
- *   strange check we do to silence compiler warnings (thanks, Ubuntu!)
+/**
+ * @brief Signal Handler for termination (SIGTERM, SIGINT).
+ *
+ * Sets the global `bFinished` flag to indicate the program should terminate.
+ *
+ * @warning This function runs in a **signal handler context**.
+ * It does NOT terminate the process directly, as that would be unsafe in a multi-threaded
+ * environment. Instead, it signals the main loop to exit gracefully.
+ *
+ * @note We avoid using `DBGPRINTF()` or other complex functions here to prevent
+ * deadlocks or undefined behavior if the signal interrupted a critical section.
+ * The `write()` check exists solely to silence compiler warnings on some platforms (e.g., Ubuntu).
+ *
+ * @param sig The signal number received.
  */
 void rsyslogdDoDie(int sig) {
 #define MSG1 "DoDie called.\n"
@@ -1951,8 +2080,9 @@ void rsyslogdDoDie(int sig) {
 }
 
 
-static void wait_timeout(const sigset_t *sigmask) {
+static rsRetVal wait_timeout(const sigset_t *sigmask) {
     struct timespec tvSelectTimeout;
+    DEFiRet;
 
     tvSelectTimeout.tv_sec = runConf->globals.janitorInterval * 60; /* interval is in minutes! */
     tvSelectTimeout.tv_nsec = 0;
@@ -1992,48 +2122,49 @@ static void wait_timeout(const sigset_t *sigmask) {
                 rc = recvfrom(SRC_FD, &srcpacket, SRCMSG, 0, &srcaddr, &addrsz);
                 if (rc < 0) {
                     if (errno != EINTR) {
-                        fprintf(stderr, "%s: ERROR: '%d' recvfrom\n", progname, errno);
-                        exit(1);  // TODO: this needs to be handled gracefully
+                        LogError(errno, NO_ERRCODE, "%s: ERROR: recvfrom failed - disabling AIX SRC", progname);
+                        src_exists = FALSE;
+                        ABORT_FINALIZE(RS_RET_IO_ERROR);
                     } else { /* punt on short read */
-                        return;
+                        FINALIZE;
                     }
+                }
 
-                    switch (srcpacket.subreq.action) {
-                        case START:
+                switch (srcpacket.subreq.action) {
+                    case START:
+                        dosrcpacket(SRC_SUBMSG,
+                                    "ERROR: rsyslogd does not support this "
+                                    "option.\n",
+                                    sizeof(struct srcrep));
+                        break;
+                    case STOP:
+                        if (srcpacket.subreq.object == SUBSYSTEM) {
+                            dosrcpacket(SRC_OK, NULL, sizeof(struct srcrep));
+                            (void)snprintf(buf, sizeof(buf) / sizeof(char),
+                                           " [origin "
+                                           "software=\"rsyslogd\" "
+                                           "swVersion=\"" VERSION
+                                           "\" x-pid=\"%d\" x-info=\"https://www.rsyslog.com\"]"
+                                           " exiting due to stopsrc.",
+                                           (int)glblGetOurPid());
+                            errno = 0;
+                            logmsgInternal(NO_ERRCODE, LOG_SYSLOG | LOG_INFO, (uchar *)buf, 0);
+                            FINALIZE;
+                        } else
                             dosrcpacket(SRC_SUBMSG,
-                                        "ERROR: rsyslogd does not support this "
-                                        "option.\n",
+                                        "ERROR: rsyslogd does not support "
+                                        "this option.\n",
                                         sizeof(struct srcrep));
-                            break;
-                        case STOP:
-                            if (srcpacket.subreq.object == SUBSYSTEM) {
-                                dosrcpacket(SRC_OK, NULL, sizeof(struct srcrep));
-                                (void)snprintf(buf, sizeof(buf) / sizeof(char),
-                                               " [origin "
-                                               "software=\"rsyslogd\" "
-                                               "swVersion=\"" VERSION
-                                               "\" x-pid=\"%d\" x-info=\"https://www.rsyslog.com\"]"
-                                               " exiting due to stopsrc.",
-                                               (int)glblGetOurPid());
-                                errno = 0;
-                                logmsgInternal(NO_ERRCODE, LOG_SYSLOG | LOG_INFO, (uchar *)buf, 0);
-                                return;
-                            } else
-                                dosrcpacket(SRC_SUBMSG,
-                                            "ERROR: rsyslogd does not support "
-                                            "this option.\n",
-                                            sizeof(struct srcrep));
-                            break;
-                        case REFRESH:
-                            dosrcpacket(SRC_SUBMSG,
-                                        "ERROR: rsyslogd does not support this "
-                                        "option.\n",
-                                        sizeof(struct srcrep));
-                            break;
-                        default:
-                            dosrcpacket(SRC_SUBICMD, NULL, sizeof(struct srcrep));
-                            break;
-                    }
+                        break;
+                    case REFRESH:
+                        dosrcpacket(SRC_SUBMSG,
+                                    "ERROR: rsyslogd does not support this "
+                                    "option.\n",
+                                    sizeof(struct srcrep));
+                        break;
+                    default:
+                        dosrcpacket(SRC_SUBICMD, NULL, sizeof(struct srcrep));
+                        break;
                 }
             }
         }
@@ -2041,9 +2172,23 @@ static void wait_timeout(const sigset_t *sigmask) {
 #else
     pselect(0, NULL, NULL, NULL, &tvSelectTimeout, sigmask);
 #endif /* AIXPORT : SRC end */
+
+#ifdef _AIX
+finalize_it:
+#endif
+    RETiRet;
 }
 
 
+/**
+ * @brief Reap Terminated Child Processes.
+ *
+ * Loops through all terminated child processes (`waitpid` with `WNOHANG`)
+ * and reports their exit status.
+ *
+ * Useful for monitoring short-lived helper processes or scripts launched by rsyslog.
+ * Also needed for proper cleanup of child processes in case of termination.
+ */
 static void reapChild(void) {
     pid_t child;
     do {
@@ -2056,10 +2201,14 @@ static void reapChild(void) {
 }
 
 
-/* This is the main processing loop. It is called after successful initialization.
- * When it returns, the syslogd terminates.
- * Its sole function is to provide some housekeeping things. The real work is done
- * by the other threads spawned.
+/**
+ * @brief Application Main Loop.
+ *
+ * Handles housekeeping tasks (signal handling, child reaping, time updates)
+ * while worker threads perform the actual log processing.
+ *
+ * @note This function blocks waiting for signals (`wait_timeout`) and only exits when
+ * `bFinished` is set (e.g., by `rsyslogdDoDie`).
  */
 static void mainloop(void) {
     time_t tTime;
@@ -2214,10 +2363,15 @@ static void deinitAll(void) {
     clearPidFile();
 }
 
-/* This is the main entry point into rsyslogd. This must be a function in its own
- * right in order to initialize the debug system in a portable way (otherwise we would
- * need to have a statement before variable definitions.
- * rgerhards, 20080-01-28
+/**
+ * @brief Application Entry Point.
+ *
+ * Initializes the debug system and invokes the main initialization sequence.
+ * This is kept minimal to ensure the debug system is initialized early and in a portable way.
+ *
+ * @param argc Number of arguments.
+ * @param argv Array of argument strings.
+ * @return 0 on clean exit, non-zero on error.
  */
 int main(int argc, char **argv) {
 #if defined(_AIX)

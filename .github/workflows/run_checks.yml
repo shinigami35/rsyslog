@@ -1,4 +1,4 @@
-# Copyright 2024-2025 Rainer Gerhards and Others
+# Copyright 2024-2026 Rainer Gerhards and Others
 #
 # https://github.com/rsyslog/rsyslog-pkg-ubuntu
 #
@@ -38,6 +38,7 @@ on:
       - 'tests/*.sh'
       - 'diag.sh'
       - '**/Makefile.am'
+      - '!doc/Makefile.am'
       - 'configure.ac'
       - '.github/workflows/*.yml'
 
@@ -54,7 +55,7 @@ jobs:
                  fedora_41, fedora_42,
                  ubuntu_20, ubuntu_24,
                  ubuntu_22_san, ubuntu_24_tsan, ubuntu_22_distcheck,
-                 openeuler, elasticsearch]
+                 openeuler, wolfssl, elasticsearch]
 
     steps:
       - name: git checkout project
@@ -145,7 +146,7 @@ jobs:
               # It is better to run at least the majority of checks than to postpone that
               # any longer. 2025-01-31 RGerhards
               export RSYSLOG_CONFIGURE_OPTIONS_EXTRA="--enable-omazureeventhubs --enable-imdtls \
-                    --enable-omdtls --enable-omotlp --disable-omamqp1 --disable-snmp --disable-kafka-tests \
+                    --enable-omdtls --enable-omotel --disable-omamqp1 --disable-snmp --disable-kafka-tests \
                     --disable-elasticsearch-tests --enable-mmsnareparse"
               ;;
           'ubuntu_22_distcheck')
@@ -155,18 +156,22 @@ jobs:
               export ABORT_ALL_ON_TEST_FAIL='YES'
               export VERBOSE=1
               ;;
-          'ubuntu_22_san')
+          'ubuntu_24_san')
+              # TODO: remove the -fno-sanitize=function once the root issue is solved. We use
+              #       it in order to migrate to the newer sanitizer checker which otherwise
+              #       would be much delayed. That was the prime reason we did not upgrade before.
               export CI_SANITIZE_BLACKLIST='tests/asan.supp'
-              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_ubuntu:22.04'
+              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_ubuntu:24.04'
               export CC='clang'
               export RSYSLOG_CONFIGURE_OPTIONS_EXTRA="--disable-elasticsearch-tests \
                       --disable-libfaketime --without-valgrind-testbench --disable-valgrind \
-                      --enable-omotlp \
+                      --enable-omotel \
                       --disable-kafka-tests --enable-imdtls --enable-omdtls \
                       --enable-mmsnareparse"
               export CFLAGS="-fstack-protector -D_FORTIFY_SOURCE=2 \
                      -fsanitize=address,undefined,nullability,unsigned-integer-overflow \
                      -fno-sanitize-recover=undefined,nullability,unsigned-integer-overflow \
+                     -fno-sanitize=function \
                      -g -O3 -fno-omit-frame-pointer -fno-color-diagnostics"
               export LSAN_OPTIONS='detect_leaks=0'
               export UBSAN_OPTIONS='print_stacktrace=1'
@@ -183,7 +188,7 @@ jobs:
               # imhttp disabled because of race in civetweb (need to consider different lib)
               export RSYSLOG_CONFIGURE_OPTIONS_EXTRA="--disable-elasticsearch-tests --enable-imfile-tests \
                     --disable-impstats --disable-kafka-tests --disable-mmpstrucdata \
-                    --enable-omotlp \
+                    --enable-omotel \
                     --disable-clickhouse --disable-clickhouse-tests --disable-kafka-tests \
                     --disable-libfaketime --disable-imhttp \
                     --without-valgrind-testbench --disable-valgrind \
@@ -194,17 +199,27 @@ jobs:
               export TSAN_OPTIONS="halt_on_error=1 suppressions=/rsyslog/tests/tsan-rt.supp"
               export ABORT_ALL_ON_TEST_FAIL='YES'
               ;;
+          'wolfssl')
+              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_ubuntu:24.04'
+              export CI_VALGRIND_SUPPRESSIONS="ubuntu22.04.supp"
+              export ABORT_ALL_ON_TEST_FAIL='YES'
+              export RSYSLOG_CONFIGURE_OPTIONS_OVERRIDE="--enable-testbench --enable-omstdout \
+                     --enable-imdiag --enable-impstats --enable-imfile --disable-imfile-tests \
+                     --disable-fmhttp --enable-valgrind --disable-default-tests --disable-imtcp-tests \
+                     --enable-wolfssl"
+              export CI_MAKE_OPT='-j20'
+              export CI_MAKE_CHECK_OPT='-j8'
+              export CI_CHECK_CMD='check'
+              ;;
           'elasticsearch')
               export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_ubuntu:22.04'
-              export CI_VALGRIND_SUPPRESSIONS="ubuntu22.04.supp"
-              export CI_MAKE_CHECK_OPT='-j1'
               export ABORT_ALL_ON_TEST_FAIL='NO'
               export RSYSLOG_CONFIGURE_OPTIONS_OVERRIDE="--enable-testbench --enable-omstdout \
                      --enable-imdiag --enable-impstats --enable-imfile --disable-imfile-tests \
                      --disable-fmhttp --enable-valgrind --disable-default-tests --disable-imtcp-tests \
                      --enable-elasticsearch-tests --enable-elasticsearch"
               export CI_MAKE_OPT='-j20'
-              export CI_MAKE_CHECK_OPT='-j8'
+              export CI_MAKE_CHECK_OPT='-j3'
               export CI_CHECK_CMD='check'
               export CI_VALGRIND_SUPPRESSIONS="ubuntu22.04.supp" # they are still valid
               ;;

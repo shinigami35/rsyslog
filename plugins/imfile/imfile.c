@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
@@ -66,6 +67,7 @@
 #include "srUtils.h"
 #include "parserif.h"
 #include "datetime.h"
+#include "statsobj.h"
 
 #include <regex.h>
 
@@ -89,17 +91,19 @@ MODULE_CNFNAME("imfile")
 /* Module static data */
 DEF_IMOD_STATIC_DATA /* must be present, starts static data */
     DEFobjCurrIf(glbl) DEFobjCurrIf(strm) DEFobjCurrIf(prop) DEFobjCurrIf(ruleset) DEFobjCurrIf(datetime)
+        DEFobjCurrIf(statsobj)
 
-        extern int rs_siphash(const uint8_t *in,
-                              const size_t inlen,
-                              const uint8_t *k,
-                              uint8_t *out,
-                              const size_t outlen); /* see siphash.c */
+            extern int rs_siphash(const uint8_t *in,
+                                  const size_t inlen,
+                                  const uint8_t *k,
+                                  uint8_t *out,
+                                  const size_t outlen); /* see siphash.c */
 
 static int bLegacyCnfModGlobalsPermitted; /* are legacy module-global config parameters permitted? */
 
 #define NUM_MULTISUB 1024 /* default max number of submits */
 #define DFLT_PollInterval 10
+#define DFLT_INOTIFY_FALLBACK_INTERVAL 60
 #define INIT_WDMAP_TAB_SIZE 1 /* default wdMap table size - is extended as needed, use 2^x value */
 #define ADD_METADATA_UNSPECIFIED -1
 
@@ -210,6 +214,10 @@ struct act_obj_s {
     multi_submit_t multiSub;
     int is_symlink;
     time_t time_to_delete; /* Helper variable to DELAY the actual file delete in act_obj_unlink */
+    /* per-file statistics */
+    statsobj_t *stats; /* stats object for this file */
+    STATSCOUNTER_DEF(bytesProcessed, mutBytesProcessed); /* total bytes processed from this file */
+    STATSCOUNTER_DEF(linesProcessed, mutLinesProcessed); /* total lines processed from this file */
 };
 struct fs_edge_s {
     fs_node_t *parent; /* node pointing to this edge */
@@ -234,9 +242,11 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
 static rsRetVal ATTR_NONNULL(1) pollFile(act_obj_t *act);
 static int ATTR_NONNULL() getBasename(uchar *const __restrict__ basen, uchar *const __restrict__ path);
 static void ATTR_NONNULL() act_obj_unlink(act_obj_t *act);
+static void ATTR_NONNULL(1, 2) fs_node_walk(fs_node_t *const node, void (*f_usr)(fs_edge_t *const));
 static uchar *ATTR_NONNULL(1, 2) getStateFileName(const act_obj_t *, uchar *, const size_t);
 static int ATTR_NONNULL()
     getFullStateFileName(const uchar *const, const char *const, uchar *const pszout, const size_t ilenout);
+static void ATTR_NONNULL(1) getFileID(act_obj_t *const act);
 
 
 #define OPMODE_POLLING 0
@@ -249,6 +259,9 @@ struct modConfData_s {
     int iPollInterval; /* number of seconds to sleep when there was no file activity */
     int readTimeout;
     int timeoutGranularity; /* value in ms */
+    int maxiNotifyWatches;
+    int inotifyFallbackInterval;
+    sbool bInotifyLimitHit;
     instanceConf_t *root, *tail;
     fs_node_t *conf_tree;
     uint8_t opMode;
@@ -287,6 +300,7 @@ static wd_map_t *wdmap = NULL;
 static int nWdmap;
 static int allocMaxWdmap;
 static int ino_fd; /* fd for inotify calls */
+static sbool inotifyFallbackNeeded;
 #endif /* #if HAVE_INOTIFY_INIT -------------------------------------------------- */
 
 #if defined(OS_SOLARIS) && defined(HAVE_PORT_SOURCE_FILE)
@@ -312,6 +326,8 @@ static struct cnfparamdescr modpdescr[] = {
     {"normalizepath", eCmdHdlrBinary, 0},
     {"mode", eCmdHdlrGetWord, 0},
     {"deletestateonfilemove", eCmdHdlrBinary, 0},
+    {"maxinotifywatches", eCmdHdlrNonNegInt, 0},
+    {"inotifyfallbackinterval", eCmdHdlrNonNegInt, 0},
 };
 static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / sizeof(struct cnfparamdescr), modpdescr};
 
@@ -510,6 +526,18 @@ static int in_setupWatch(act_obj_t *const act, const int is_file) {
     int wd = -1;
     if (runModConf->opMode != OPMODE_INOTIFY) goto done;
 
+    if (runModConf->maxiNotifyWatches > 0 && nWdmap >= runModConf->maxiNotifyWatches) {
+        if (!runModConf->bInotifyLimitHit) {
+            LogError(0, RS_RET_ERR,
+                     "imfile: reached module limit for inotify watches (%d); "
+                     "falling back to periodic scans",
+                     runModConf->maxiNotifyWatches);
+        }
+        runModConf->bInotifyLimitHit = 1;
+        inotifyFallbackNeeded = 1;
+        goto done;
+    }
+
     wd =
         inotify_add_watch(ino_fd, act->name,
                           (is_file) ? IN_MODIFY | IN_DONT_FOLLOW : IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO);
@@ -519,12 +547,37 @@ static int in_setupWatch(act_obj_t *const act, const int is_file) {
         } else {
             LogError(errno, RS_RET_IO_ERROR, "imfile: cannot watch object '%s'", act->name);
         }
+        if (errno == ENOSPC) {
+            if (!runModConf->bInotifyLimitHit) {
+                LogError(errno, RS_RET_IO_ERROR, "imfile: inotify watch limit reached; falling back to periodic scans");
+            }
+            runModConf->bInotifyLimitHit = 1;
+            inotifyFallbackNeeded = 1;
+        }
         goto done;
     }
     wdmapAdd(wd, act);
     DBGPRINTF("in_setupWatch: watch %d added for %s(object %p)\n", wd, act->name, act);
 done:
     return wd;
+}
+
+static void in_retryMissingWatches(fs_edge_t *const edge) {
+    if (runModConf->opMode != OPMODE_INOTIFY) {
+        return;
+    }
+
+    for (act_obj_t *act = edge->active; act != NULL; act = act->next) {
+        if (act->wd != -1) {
+            continue;
+        }
+        int wd = in_setupWatch(act, edge->is_file);
+        if (wd >= 0) {
+            act->wd = wd;
+        } else {
+            inotifyFallbackNeeded = 1;
+        }
+    }
 }
 
 /* compare function for bsearch() */
@@ -738,6 +791,19 @@ static rsRetVal ATTR_NONNULL(1, 2) act_obj_add(fs_edge_t *const edge,
         CHKmalloc(act->multiSub.ppMsgs = malloc(inst->nMultiSub * sizeof(smsg_t *)));
         act->multiSub.maxElem = inst->nMultiSub;
         act->multiSub.nElem = 0;
+        /* initialize per-file stats */
+        act->stats = NULL;
+        STATSCOUNTER_INIT(act->bytesProcessed, act->mutBytesProcessed);
+        STATSCOUNTER_INIT(act->linesProcessed, act->mutLinesProcessed);
+        /* set up per-file stats object */
+        CHKiRet(statsobj.Construct(&act->stats));
+        CHKiRet(statsobj.SetName(act->stats, (uchar *)name));
+        CHKiRet(statsobj.SetOrigin(act->stats, (uchar *)"imfile"));
+        CHKiRet(statsobj.AddCounter(act->stats, UCHAR_CONSTANT("bytes.processed"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                    &(act->bytesProcessed)));
+        CHKiRet(statsobj.AddCounter(act->stats, UCHAR_CONSTANT("lines.processed"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                    &(act->linesProcessed)));
+        CHKiRet(statsobj.ConstructFinalize(act->stats));
         pollFile(act);
     }
 
@@ -784,34 +850,31 @@ static void detect_updates(fs_edge_t *const edge) {
                    e.g. file has been closed, so we will never have old inode (but
                         why was it closed then? --> check)
              */
-            r = fstat(act->ino, &fileInfo);
-            if (r == -1) {
-                time_t ttNow;
-                time(&ttNow);
-                if (act->time_to_delete == 0) {
-                    act->time_to_delete = ttNow;
-                }
-                /* First time we run into this code, we need to give imfile a little time to process
-                 *  the old file in case a process is still writing into it until the FILE_DELETE_DELAY
-                 *  is reached OR the inode has changed (see elseif below). In most cases, the
-                 *  delay will never be reached and the file will be closed when the inode has changed.
-                 *  Directories are deleted without delay.
-                 */
-                sbool is_file = act->edge->is_file;
-                if (!is_file || act->time_to_delete + FILE_DELETE_DELAY < ttNow) {
-                    DBGPRINTF(
-                        "detect_updates obj gone away, unlinking: "
-                        "'%s', ttDelete: %" PRId64 "s, ttNow:%" PRId64 " isFile: %d\n",
-                        act->name, (int64_t)ttNow - (act->time_to_delete + FILE_DELETE_DELAY), (int64_t)ttNow, is_file);
-                    act_obj_unlink(act);
-                    restart = 1;
-                } else {
-                    DBGPRINTF(
-                        "detect_updates obj gone away, keep '%s' "
-                        "open: %" PRId64 "/%" PRId64 "/%" PRId64 "s!\n",
-                        act->name, (int64_t)act->time_to_delete, (int64_t)ttNow, (int64_t)ttNow - act->time_to_delete);
-                    pollFile(act);
-                }
+            time_t ttNow;
+            time(&ttNow);
+            if (act->time_to_delete == 0) {
+                act->time_to_delete = ttNow;
+            }
+            /* First time we run into this code, we need to give imfile a little time to process
+             *  the old file in case a process is still writing into it until the FILE_DELETE_DELAY
+             *  is reached OR the inode has changed (see elseif below). In most cases, the
+             *  delay will never be reached and the file will be closed when the inode has changed.
+             *  Directories are deleted without delay.
+             */
+            sbool is_file = act->edge->is_file;
+            if (!is_file || act->time_to_delete + FILE_DELETE_DELAY < ttNow) {
+                DBGPRINTF(
+                    "detect_updates obj gone away, unlinking: "
+                    "'%s', ttDelete: %" PRId64 "s, ttNow:%" PRId64 " isFile: %d\n",
+                    act->name, (int64_t)ttNow - (act->time_to_delete + FILE_DELETE_DELAY), (int64_t)ttNow, is_file);
+                act_obj_unlink(act);
+                restart = 1;
+            } else {
+                DBGPRINTF(
+                    "detect_updates obj gone away, keep '%s' "
+                    "open: %" PRId64 "/%" PRId64 "/%" PRId64 "s!\n",
+                    act->name, (int64_t)act->time_to_delete, (int64_t)ttNow, (int64_t)ttNow - act->time_to_delete);
+                pollFile(act);
             }
             break;
         } else if (fileInfo.st_ino != act->ino) {
@@ -832,10 +895,13 @@ static void detect_updates(fs_edge_t *const edge) {
 
 
 /* check if active files need to be processed. This is only needed in
- * polling mode.
+ * polling mode or inotify fallback mode.
  */
 static void ATTR_NONNULL() poll_active_files(fs_edge_t *const edge) {
-    if (runModConf->opMode != OPMODE_POLLING || !edge->is_file || glbl.GetGlobalInputTermState() != 0) {
+    const sbool inotify_fallback = (runModConf->opMode == OPMODE_INOTIFY && runModConf->bInotifyLimitHit &&
+                                    runModConf->inotifyFallbackInterval > 0);
+    if ((runModConf->opMode != OPMODE_POLLING && !inotify_fallback) || !edge->is_file ||
+        glbl.GetGlobalInputTermState() != 0) {
         return;
     }
 
@@ -954,12 +1020,25 @@ static void ATTR_NONNULL() poll_timeouts(fs_edge_t *const edge) {
         }
     }
 }
+
+static void in_doFallbackScan(void) {
+    if (!runModConf->bInotifyLimitHit || runModConf->inotifyFallbackInterval <= 0) {
+        return;
+    }
+
+    inotifyFallbackNeeded = 0;
+    fs_node_walk(runModConf->conf_tree, poll_tree);
+    fs_node_walk(runModConf->conf_tree, in_retryMissingWatches);
+    if (!inotifyFallbackNeeded) {
+        runModConf->bInotifyLimitHit = 0;
+    }
+}
 #endif
 
 
 /* destruct a single act_obj object */
 static void act_obj_destroy(act_obj_t *const act, const int is_deleted) {
-    uchar *statefn;
+    uchar *statefn = NULL;
     uchar statefile[MAXFNAME];
     uchar toDel[MAXFNAME];
 
@@ -981,13 +1060,29 @@ static void act_obj_destroy(act_obj_t *const act, const int is_deleted) {
     if (act->pStrm != NULL) {
         const instanceConf_t *const inst = act->edge->instarr[0];  // TODO: same file, multiple instances?
         pollFile(act); /* get any left-over data */
-        if (inst->bRMStateOnDel) {
+        /* destroy per-file stats */
+        if (act->stats) {
+            statsobj.Destruct(&act->stats);
+            act->stats = NULL;
+        }
+        if (inst->bRMStateOnDel || (is_deleted && inst->bRMStateOnMove)) {
+            int lenout;
             statefn = getStateFileName(act, statefile, sizeof(statefile));
-            getFullStateFileName(statefn, act->file_id, toDel, sizeof(toDel));  // TODO: check!
-            statefn = toDel;
+            getFileID(act);
+            lenout = getFullStateFileName(statefn, act->file_id, toDel, sizeof(toDel));
+            if (lenout < 0 || (size_t)lenout >= sizeof(toDel)) {
+                LogError(0, RS_RET_ERR, "imfile: could not get full state file name for '%s'", act->name);
+                statefn = NULL;
+            } else {
+                statefn = toDel;
+            }
         }
         persistStrmState(act);
         strm.Destruct(&act->pStrm);
+
+        /* destroy stats counter mutexes to avoid leaks (only for file objects) */
+        DESTROY_ATOMIC_HELPER_MUT64(act->mutBytesProcessed);
+        DESTROY_ATOMIC_HELPER_MUT64(act->mutLinesProcessed);
 
         /*
          * We delete the state file after the destruct operation to ensure that any pending
@@ -998,7 +1093,7 @@ static void act_obj_destroy(act_obj_t *const act, const int is_deleted) {
          *   - If the configuration specifies not to preserve the state file after the file
          *     has been renamed. This prevents orphaned state files.
          */
-        if (is_deleted && ((!act->in_move && inst->bRMStateOnDel) || inst->bRMStateOnMove)) {
+        if (statefn != NULL && is_deleted && ((!act->in_move && inst->bRMStateOnDel) || inst->bRMStateOnMove)) {
             DBGPRINTF("act_obj_destroy: deleting state file %s\n", statefn);
             unlink((char *)statefn);
         }
@@ -1590,6 +1685,14 @@ static rsRetVal ATTR_NONNULL() pollFileReal(act_obj_t *act, cstr_t **pCStr) {
             startOffs = act->pStrm->iCurrOffs; /* disable check */
         }
         runModConf->bHadFileData = 1; /* this is just a flag, so set it and forget it */
+        /* account bytes and lines processed for this file */
+        if (act->pStrm != NULL) {
+            int64_t endOffs = act->pStrm->iCurrOffs;
+            if (endOffs > strtOffs) {
+                STATSCOUNTER_ADD(act->bytesProcessed, act->mutBytesProcessed, (uint64_t)(endOffs - strtOffs));
+            }
+            STATSCOUNTER_INC(act->linesProcessed, act->mutLinesProcessed);
+        }
         CHKiRet(enqLine(act, *pCStr, strtOffs)); /* process line */
         rsCStrDestruct(pCStr); /* discard string (must be done by us!) */
         if (inst->iPersistStateInterval > 0 && ++act->nRecords >= inst->iPersistStateInterval) {
@@ -1981,6 +2084,9 @@ BEGINbeginCnfLoad
     loadModConf->readTimeout = 0; /* default: no timeout */
     loadModConf->timeoutGranularity = 1000; /* default: 1 second */
     loadModConf->haveReadTimeouts = 0; /* default: no timeout */
+    loadModConf->maxiNotifyWatches = 0; /* default: no limit */
+    loadModConf->inotifyFallbackInterval = DFLT_INOTIFY_FALLBACK_INTERVAL;
+    loadModConf->bInotifyLimitHit = 0;
     loadModConf->normalizePath = 1;
     loadModConf->sortFiles = GLOB_NOSORT;
     loadModConf->stateFileDirectory = NULL;
@@ -2037,6 +2143,10 @@ BEGINsetModCnf
         } else if (!strcmp(modpblk.descr[i].name, "timeoutgranularity")) {
             /* note: we need ms, thus "* 1000" */
             loadModConf->timeoutGranularity = (int)pvals[i].val.d.n * 1000;
+        } else if (!strcmp(modpblk.descr[i].name, "maxinotifywatches")) {
+            loadModConf->maxiNotifyWatches = (int)pvals[i].val.d.n;
+        } else if (!strcmp(modpblk.descr[i].name, "inotifyfallbackinterval")) {
+            loadModConf->inotifyFallbackInterval = (int)pvals[i].val.d.n;
         } else if (!strcmp(modpblk.descr[i].name, "sortfiles")) {
             loadModConf->sortFiles = ((sbool)pvals[i].val.d.n) ? 0 : GLOB_NOSORT;
         } else if (!strcmp(modpblk.descr[i].name, "statefile.directory")) {
@@ -2359,6 +2469,7 @@ static rsRetVal do_inotify(void) {
     int rd;
     int currev;
     static int last_timeout = 0;
+    time_t last_fallback = 0;
     struct pollfd pollfd;
     DEFiRet;
 
@@ -2376,24 +2487,42 @@ static rsRetVal do_inotify(void) {
 
     while (glbl.GetGlobalInputTermState() == 0) {
         int r;
+        int poll_timeout = -1;
 
         pollfd.fd = ino_fd;
         pollfd.events = POLLIN;
 
-        if (runModConf->haveReadTimeouts)
-            r = poll(&pollfd, 1, runModConf->timeoutGranularity);
-        else
-            r = poll(&pollfd, 1, -1);
+        if (runModConf->haveReadTimeouts) {
+            poll_timeout = runModConf->timeoutGranularity;
+        }
+        if (runModConf->bInotifyLimitHit && runModConf->inotifyFallbackInterval > 0) {
+            int fallback_timeout = runModConf->inotifyFallbackInterval;
+            if (fallback_timeout > INT_MAX / 1000) {
+                fallback_timeout = INT_MAX / 1000;
+            }
+            fallback_timeout *= 1000;
+            if (poll_timeout == -1 || fallback_timeout < poll_timeout) {
+                poll_timeout = fallback_timeout;
+            }
+        }
+        r = poll(&pollfd, 1, poll_timeout);
 
         if (r == -1 && errno == EINTR) {
             DBGPRINTF("do_inotify interrupted while polling on ino_fd\n");
             continue;
         }
         if (r == 0) {
-            DBGPRINTF("readTimeouts are configured, checking if some apply\n");
             if (runModConf->haveReadTimeouts) {
+                DBGPRINTF("readTimeouts are configured, checking if some apply\n");
                 fs_node_walk(runModConf->conf_tree, poll_timeouts);
                 last_timeout = time(NULL);
+            }
+            if (runModConf->bInotifyLimitHit && runModConf->inotifyFallbackInterval > 0) {
+                time_t now = time(NULL);
+                if (last_fallback == 0 || last_fallback + runModConf->inotifyFallbackInterval <= now) {
+                    in_doFallbackScan();
+                    last_fallback = now;
+                }
             }
             continue;
         } else if (r == -1) {
@@ -2410,9 +2539,16 @@ static rsRetVal do_inotify(void) {
             // process timeouts always, ino_fd may be too busy to ever have timeout occur from poll
             if (runModConf->haveReadTimeouts) {
                 int now = time(NULL);
-                if (last_timeout + (runModConf->timeoutGranularity / 1000) > now) {
+                if (last_timeout + (runModConf->timeoutGranularity / 1000) <= now) {
                     fs_node_walk(runModConf->conf_tree, poll_timeouts);
                     last_timeout = time(NULL);
+                }
+            }
+            if (runModConf->bInotifyLimitHit && runModConf->inotifyFallbackInterval > 0) {
+                time_t now = time(NULL);
+                if (last_fallback == 0 || last_fallback + runModConf->inotifyFallbackInterval <= now) {
+                    in_doFallbackScan();
+                    last_fallback = now;
                 }
             }
             rd = read(ino_fd, iobuf, sizeof(iobuf));
@@ -2761,6 +2897,7 @@ BEGINmodExit
     objRelease(prop, CORE_COMPONENT);
     objRelease(ruleset, CORE_COMPONENT);
     objRelease(datetime, CORE_COMPONENT);
+    objRelease(statsobj, CORE_COMPONENT);
 
 #ifdef HAVE_INOTIFY_INIT
     free(wdmap);
@@ -2828,6 +2965,7 @@ BEGINmodInit()
     CHKiRet(objUse(ruleset, CORE_COMPONENT));
     CHKiRet(objUse(prop, CORE_COMPONENT));
     CHKiRet(objUse(datetime, CORE_COMPONENT));
+    CHKiRet(objUse(statsobj, CORE_COMPONENT));
 
     DBGPRINTF("version %s initializing\n", VERSION);
     CHKiRet(omsdRegCFSLineHdlr((uchar *)"inputfilename", 0, eCmdHdlrGetWord, NULL, &cs.pszFileName,

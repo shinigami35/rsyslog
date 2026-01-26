@@ -157,7 +157,6 @@ static struct {
     STATSCOUNTER_DEF(ctrRead, mutCtrRead);
     STATSCOUNTER_DEF(ctrDiscarded, mutCtrDiscarded);
     STATSCOUNTER_DEF(ctrFailed, mutCtrFailed);
-    STATSCOUNTER_DEF(ctrPollFailed, mutCtrPollFailed);
     STATSCOUNTER_DEF(ctrRotations, mutCtrRotations);
     STATSCOUNTER_DEF(ctrRecoveryAttempts, mutCtrRecoveryAttempts);
     uint64 ratelimitDiscardedInInterval;
@@ -457,20 +456,45 @@ static rsRetVal readjournal(struct journalContext_s *journalContext, ruleset_t *
 
     /* Get message severity ("priority" in journald's terminology) */
     if (journalGetData(journalContext, "PRIORITY", &get, &length) >= 0) {
-        if (length == 10) {
-            severity = ((char *)get)[9] - '0';
-            if (severity < 0 || 7 < severity) {
-                LogError(0, RS_RET_ERR,
-                         "imjournal: the value of the 'PRIORITY' field is "
-                         "out of bounds: %d, resetting",
-                         severity);
+        /* value is "PRIORITY=x", so we need to skip 9 characters */
+        if (length > 9) {
+            char prio_buf[12];
+            char *p;
+            size_t val_len = length - 9;
+
+            if (val_len >= sizeof(prio_buf)) {
+                val_len = sizeof(prio_buf) - 1;
+            }
+            memcpy(prio_buf, (const char *)get + 9, val_len);
+            prio_buf[val_len] = '\0';
+
+            long priority = strtol(prio_buf, &p, 10);
+            /* check for conversion errors */
+            if (p > prio_buf) {
+                if (priority < 0 || 7 < priority) {
+                    /* Only log invalid values if they are numeric.
+                     * We use LOG_INFO to avoid flooding the log if there is a
+                     * persistent issue with the journal data.
+                     */
+                    LogMsg(0, RS_RET_OK, LOG_INFO,
+                           "imjournal: the value of the 'PRIORITY' field is "
+                           "out of bounds: %ld, resetting",
+                           priority);
+                    severity = cs.iDfltSeverity;
+                } else {
+                    severity = (int)priority;
+                }
+            } else {
+                /* We silently ignore non-parsable priority values.
+                 * This is robust against unexpected journal data formats.
+                 */
                 severity = cs.iDfltSeverity;
             }
         } else {
-            LogError(0, RS_RET_ERR,
-                     "The value of the 'PRIORITY' field has an "
-                     "unexpected length: %zu\n",
-                     length);
+            /* We silently ignore unexpected length.
+             * This prevents log flooding if the journal data is malformed.
+             */
+            severity = cs.iDfltSeverity;
         }
     }
 
@@ -698,6 +722,11 @@ static rsRetVal pollJournal(struct journalContext_s *journalContext, char *state
 
     err = sd_journal_wait(journalContext->j, POLL_TIMEOUT);
     if (err == SD_JOURNAL_INVALIDATE) {
+        const int processRet = sd_journal_process(journalContext->j);
+        if (processRet < 0) {
+            LogError(-processRet, RS_RET_ERR, "imjournal: sd_journal_process() failed during rotation handling");
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
         CHKiRet(handleRotation(journalContext, stateFile));
     }
 
@@ -1108,9 +1137,6 @@ BEGINactivateCnf
     STATSCOUNTER_INIT(statsCounter.ctrFailed, statsCounter.mutCtrFailed);
     CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("failed"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &(statsCounter.ctrFailed)));
-    STATSCOUNTER_INIT(statsCounter.ctrPollFailed, statsCounter.mutCtrPollFailed);
-    CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("poll_failed"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
-                                &(statsCounter.ctrPollFailed)));
     STATSCOUNTER_INIT(statsCounter.ctrRotations, statsCounter.mutCtrRotations);
     CHKiRet(statsobj.AddCounter(statsCounter.stats, UCHAR_CONSTANT("rotations"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &(statsCounter.ctrRotations)));

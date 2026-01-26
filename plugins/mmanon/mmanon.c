@@ -54,6 +54,9 @@ DEF_OMOD_STATIC_DATA;
 // enumerator for the mode
 enum mode { ZERO, RANDOMINT, SIMPLE };
 
+// options for handling the max-retry limit in random-consistent-unique mode
+enum maxRetryOption { MAX_RETRY_ZERO, MAX_RETRY_ACCEPT_DUPLICATES };
+
 /*
  * Binary tree node used in consistent IPv4 randomization. Each level mirrors
  * one bit of the original address; the final node stores two replacement
@@ -94,6 +97,11 @@ typedef struct _instanceData {
         int8_t bits;
         union node *Root;
         int randConsis;
+        int randConsisUnique;
+        sbool limitMaxRetries;
+        unsigned int maxRetryCount;
+        enum maxRetryOption maxRetryFallback;
+        struct hashtable *randConsisUniqueGeneratedIPs;
         enum mode mode;
         uchar replaceChar;
     } ipv4;
@@ -103,7 +111,12 @@ typedef struct _instanceData {
         uint8_t bits;
         enum mode anonmode;
         int randConsis;
-        struct hashtable *hash;
+        int randConsisUnique;
+        sbool limitMaxRetries;
+        unsigned int maxRetryCount;
+        enum maxRetryOption maxRetryFallback;
+        struct hashtable *randConsisUniqueGeneratedIPs;
+        struct hashtable *randConsisIPs;
     } ipv6;
 
     struct {
@@ -111,7 +124,12 @@ typedef struct _instanceData {
         uint8_t bits;
         enum mode anonmode;
         int randConsis;
-        struct hashtable *hash;
+        int randConsisUnique;
+        sbool limitMaxRetries;
+        unsigned int maxRetryCount;
+        enum maxRetryOption maxRetryFallback;
+        struct hashtable *randConsisUniqueGeneratedIPs;
+        struct hashtable *randConsisIPs;
     } embeddedIPv4;
 } instanceData;
 
@@ -126,6 +144,9 @@ struct modConfData_s {
 static modConfData_t *loadModConf = NULL;  // modConf ptr to use for the current load process
 static modConfData_t *runModConf = NULL;  // modConf ptr to use for the current exec process
 
+static unsigned hash_from_u32(void *k);
+static int key_equals_u32(void *key1, void *key2);
+
 
 /* tables for interfacing with the v6 config system */
 /* action (instance) parameters */
@@ -135,12 +156,21 @@ static struct cnfparamdescr actpdescr[] = {{"ipv4.enable", eCmdHdlrBinary, 0},
                                            {"ipv4.bits", eCmdHdlrPositiveInt, 0},
                                            {"ipv4.replacechar", eCmdHdlrGetChar, 0},
                                            {"replacementchar", eCmdHdlrGetChar, 0},
+                                           {"ipv4.limituniquemaxretries", eCmdHdlrBinary, 0},
+                                           {"ipv4.uniqueretrycount", eCmdHdlrPositiveInt, 0},
+                                           {"ipv4.maxretryhandling", eCmdHdlrGetWord, 0},
                                            {"ipv6.enable", eCmdHdlrBinary, 0},
                                            {"ipv6.anonmode", eCmdHdlrGetWord, 0},
                                            {"ipv6.bits", eCmdHdlrPositiveInt, 0},
+                                           {"ipv6.limituniquemaxretries", eCmdHdlrBinary, 0},
+                                           {"ipv6.uniqueretrycount", eCmdHdlrPositiveInt, 0},
+                                           {"ipv6.maxretryhandling", eCmdHdlrGetWord, 0},
                                            {"embeddedipv4.enable", eCmdHdlrBinary, 0},
                                            {"embeddedipv4.anonmode", eCmdHdlrGetWord, 0},
-                                           {"embeddedipv4.bits", eCmdHdlrPositiveInt, 0}};
+                                           {"embeddedipv4.bits", eCmdHdlrPositiveInt, 0},
+                                           {"embeddedipv4.limituniquemaxretries", eCmdHdlrBinary, 0},
+                                           {"embeddedipv4.uniqueretrycount", eCmdHdlrPositiveInt, 0},
+                                           {"embeddedipv4.maxretryhandling", eCmdHdlrGetWord, 0}};
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
 BEGINbeginCnfLoad
@@ -210,11 +240,20 @@ static void delTree(union node *node, const int layer) {
 BEGINfreeInstance
     CODESTARTfreeInstance;
     delTree(pData->ipv4.Root, 0);
-    if (pData->ipv6.hash != NULL) {
-        hashtable_destroy(pData->ipv6.hash, 1);
+    if (pData->ipv4.randConsisUniqueGeneratedIPs != NULL) {
+        hashtable_destroy(pData->ipv4.randConsisUniqueGeneratedIPs, 0);
     }
-    if (pData->embeddedIPv4.hash != NULL) {
-        hashtable_destroy(pData->embeddedIPv4.hash, 1);
+    if (pData->ipv6.randConsisIPs != NULL) {
+        hashtable_destroy(pData->ipv6.randConsisIPs, 1);
+    }
+    if (pData->ipv6.randConsisUniqueGeneratedIPs != NULL) {
+        hashtable_destroy(pData->ipv6.randConsisUniqueGeneratedIPs, 0);
+    }
+    if (pData->embeddedIPv4.randConsisIPs != NULL) {
+        hashtable_destroy(pData->embeddedIPv4.randConsisIPs, 1);
+    }
+    if (pData->embeddedIPv4.randConsisUniqueGeneratedIPs != NULL) {
+        hashtable_destroy(pData->embeddedIPv4.randConsisUniqueGeneratedIPs, 0);
     }
     pthread_mutex_destroy(&pData->ipv4Mutex);
     pthread_mutex_destroy(&pData->ipv6Mutex);
@@ -239,6 +278,11 @@ static inline void setInstParamDefaults(instanceData *pData) {
     pData->ipv4.bits = 16;
     pData->ipv4.Root = NULL;
     pData->ipv4.randConsis = 0;
+    pData->ipv4.randConsisUnique = 0;
+    pData->ipv4.limitMaxRetries = 0;
+    pData->ipv4.maxRetryCount = 1000;
+    pData->ipv4.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+    pData->ipv4.randConsisUniqueGeneratedIPs = NULL;
     pData->ipv4.mode = ZERO;
     pData->ipv4.replaceChar = 'x';
 
@@ -246,13 +290,23 @@ static inline void setInstParamDefaults(instanceData *pData) {
     pData->ipv6.bits = 96;
     pData->ipv6.anonmode = ZERO;
     pData->ipv6.randConsis = 0;
-    pData->ipv6.hash = NULL;
+    pData->ipv6.randConsisUnique = 0;
+    pData->ipv6.limitMaxRetries = 0;
+    pData->ipv6.maxRetryCount = 1000;
+    pData->ipv6.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+    pData->ipv6.randConsisUniqueGeneratedIPs = NULL;
+    pData->ipv6.randConsisIPs = NULL;
 
     pData->embeddedIPv4.enable = 1;
     pData->embeddedIPv4.bits = 96;
     pData->embeddedIPv4.anonmode = ZERO;
     pData->embeddedIPv4.randConsis = 0;
-    pData->embeddedIPv4.hash = NULL;
+    pData->embeddedIPv4.randConsisUnique = 0;
+    pData->embeddedIPv4.limitMaxRetries = 0;
+    pData->embeddedIPv4.maxRetryCount = 1000;
+    pData->embeddedIPv4.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+    pData->embeddedIPv4.randConsisUniqueGeneratedIPs = NULL;
+    pData->embeddedIPv4.randConsisIPs = NULL;
 }
 
 BEGINnewActInst
@@ -283,6 +337,11 @@ BEGINnewActInst
                                      sizeof("random-consistent") - 1)) {
                 pData->ipv4.mode = RANDOMINT;
                 pData->ipv4.randConsis = 1;
+            } else if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"random-consistent-unique",
+                                     sizeof("random-consistent-unique") - 1)) {
+                pData->ipv4.mode = RANDOMINT;
+                pData->ipv4.randConsis = 1;
+                pData->ipv4.randConsisUnique = 1;
             } else {
                 parser_errmsg(
                     "mmanon: configuration error, unknown option for ipv4.mode, "
@@ -293,7 +352,7 @@ BEGINnewActInst
                 pData->ipv4.bits = (int8_t)pvals[i].val.d.n;
             } else {
                 pData->ipv4.bits = 32;
-                parser_errmsg(
+                parser_warnmsg(
                     "warning: invalid number of ipv4.bits (%d), corrected "
                     "to 32",
                     (int)pvals[i].val.d.n);
@@ -305,6 +364,30 @@ BEGINnewActInst
             uchar *tmp = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
             pData->ipv4.replaceChar = tmp[0];
             free(tmp);
+        } else if (!strcmp(actpblk.descr[i].name, "ipv4.limituniquemaxretries")) {
+            pData->ipv4.limitMaxRetries = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "ipv4.uniqueretrycount")) {
+            if (pvals[i].val.d.n >= 0) {
+                pData->ipv4.maxRetryCount = (unsigned int)pvals[i].val.d.n;
+            } else {
+                pData->ipv4.maxRetryCount = 1000;
+                parser_warnmsg(
+                    "warning: invalid number of ipv4.uniqueRetryCount (%d), "
+                    "corrected to 1000",
+                    (int)pvals[i].val.d.n);
+            }
+        } else if (!strcmp(actpblk.descr[i].name, "ipv4.maxretryhandling")) {
+            if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"zero", sizeof("zero") - 1)) {
+                pData->ipv4.maxRetryFallback = MAX_RETRY_ZERO;
+            } else if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"accept-duplicates",
+                                     sizeof("accept-duplicates") - 1)) {
+                pData->ipv4.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+            } else {
+                pData->ipv4.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+                parser_errmsg(
+                    "mmanon: configuration error, unknown option for "
+                    "ipv4.maxRetryHandling, will use \"accept-duplicates\"\n");
+            }
         } else if (!strcmp(actpblk.descr[i].name, "ipv6.enable")) {
             pData->ipv6.enable = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "ipv6.bits")) {
@@ -312,7 +395,7 @@ BEGINnewActInst
                 pData->ipv6.bits = (uint8_t)pvals[i].val.d.n;
             } else {
                 pData->ipv6.bits = 128;
-                parser_errmsg(
+                parser_warnmsg(
                     "warning: invalid number of ipv6.bits (%d), corrected "
                     "to 128",
                     (int)pvals[i].val.d.n);
@@ -326,10 +409,39 @@ BEGINnewActInst
                                      sizeof("random-consistent") - 1)) {
                 pData->ipv6.anonmode = RANDOMINT;
                 pData->ipv6.randConsis = 1;
+            } else if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"random-consistent-unique",
+                                     sizeof("random-consistent-unique") - 1)) {
+                pData->ipv6.anonmode = RANDOMINT;
+                pData->ipv6.randConsis = 1;
+                pData->ipv6.randConsisUnique = 1;
             } else {
                 parser_errmsg(
                     "mmanon: configuration error, unknown option for "
-                    "ipv6.anonmode, will use \"zero\"\n");
+                    "ipv6.anonMode, will use \"zero\"\n");
+            }
+        } else if (!strcmp(actpblk.descr[i].name, "ipv6.limituniquemaxretries")) {
+            pData->ipv6.limitMaxRetries = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "ipv6.uniqueretrycount")) {
+            if (pvals[i].val.d.n >= 0) {
+                pData->ipv6.maxRetryCount = (unsigned int)pvals[i].val.d.n;
+            } else {
+                pData->ipv6.maxRetryCount = 1000;
+                parser_warnmsg(
+                    "warning: invalid number of ipv6.uniqueRetryCount (%d), "
+                    "corrected to 1000",
+                    (int)pvals[i].val.d.n);
+            }
+        } else if (!strcmp(actpblk.descr[i].name, "ipv6.maxretryhandling")) {
+            if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"zero", sizeof("zero") - 1)) {
+                pData->ipv6.maxRetryFallback = MAX_RETRY_ZERO;
+            } else if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"accept-duplicates",
+                                     sizeof("accept-duplicates") - 1)) {
+                pData->ipv6.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+            } else {
+                pData->ipv6.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+                parser_errmsg(
+                    "mmanon: configuration error, unknown option for "
+                    "ipv6.maxRetryHandling, will use \"accept-duplicates\"\n");
             }
         } else if (!strcmp(actpblk.descr[i].name, "embeddedipv4.enable")) {
             pData->embeddedIPv4.enable = (int)pvals[i].val.d.n;
@@ -338,8 +450,8 @@ BEGINnewActInst
                 pData->embeddedIPv4.bits = (uint8_t)pvals[i].val.d.n;
             } else {
                 pData->embeddedIPv4.bits = 128;
-                parser_errmsg(
-                    "warning: invalid number of embeddedipv4.bits (%d), "
+                parser_warnmsg(
+                    "warning: invalid number of embeddedIpv4.bits (%d), "
                     "corrected to 128",
                     (int)pvals[i].val.d.n);
             }
@@ -352,10 +464,39 @@ BEGINnewActInst
                                      sizeof("random-consistent") - 1)) {
                 pData->embeddedIPv4.anonmode = RANDOMINT;
                 pData->embeddedIPv4.randConsis = 1;
+            } else if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"random-consistent-unique",
+                                     sizeof("random-consistent-unique") - 1)) {
+                pData->embeddedIPv4.anonmode = RANDOMINT;
+                pData->embeddedIPv4.randConsis = 1;
+                pData->embeddedIPv4.randConsisUnique = 1;
             } else {
                 parser_errmsg(
-                    "mmanon: configuration error, unknown option for ipv6.anonmode, "
+                    "mmanon: configuration error, unknown option for embeddedIpv4.anonMode, "
                     "will use \"zero\"\n");
+            }
+        } else if (!strcmp(actpblk.descr[i].name, "embeddedipv4.limituniquemaxretries")) {
+            pData->embeddedIPv4.limitMaxRetries = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "embeddedipv4.uniqueretrycount")) {
+            if (pvals[i].val.d.n >= 0) {
+                pData->embeddedIPv4.maxRetryCount = (unsigned int)pvals[i].val.d.n;
+            } else {
+                pData->embeddedIPv4.maxRetryCount = 1000;
+                parser_warnmsg(
+                    "warning: invalid number of embeddedIpv4.uniqueRetryCount (%d), "
+                    "corrected to 1000",
+                    (int)pvals[i].val.d.n);
+            }
+        } else if (!strcmp(actpblk.descr[i].name, "embeddedipv4.maxretryhandling")) {
+            if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"zero", sizeof("zero") - 1)) {
+                pData->embeddedIPv4.maxRetryFallback = MAX_RETRY_ZERO;
+            } else if (!es_strbufcmp(pvals[i].val.d.estr, (uchar *)"accept-duplicates",
+                                     sizeof("accept-duplicates") - 1)) {
+                pData->embeddedIPv4.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+            } else {
+                pData->embeddedIPv4.maxRetryFallback = MAX_RETRY_ACCEPT_DUPLICATES;
+                parser_errmsg(
+                    "mmanon: configuration error, unknown option for "
+                    "embeddedIpv4.maxRetryHandling, will use \"accept-duplicates\"\n");
             }
         } else {
             parser_errmsg(
@@ -725,22 +866,23 @@ static unsigned ipv42num(const char *str) {
  *
  * \param ip original IPv4 value.
  * \param pWrkrData worker context providing configuration and RNG state.
+ * \param bits number of bits to anonymize.
+ * \param mode anonymization mode to apply.
  * \return rewritten IPv4 value.
  */
-static unsigned code_int(unsigned ip, wrkrInstanceData_t *pWrkrData) {
+static unsigned code_ipv4_int(unsigned ip, wrkrInstanceData_t *pWrkrData, int bits, enum mode mode) {
     unsigned random;
     unsigned long long shiftIP_subst = ip;
     // variable needed because shift operation of 32nd bit in unsigned does not work
-    switch (pWrkrData->pData->ipv4.mode) {
+    switch (mode) {
         case ZERO:
             // zero out the configured prefix length
-            shiftIP_subst = ((shiftIP_subst >> (pWrkrData->pData->ipv4.bits)) << (pWrkrData->pData->ipv4.bits));
+            shiftIP_subst = ((shiftIP_subst >> bits) << bits);
             return (unsigned)shiftIP_subst;
         case RANDOMINT:
-            shiftIP_subst = ((shiftIP_subst >> (pWrkrData->pData->ipv4.bits)) << (pWrkrData->pData->ipv4.bits));
+            shiftIP_subst = ((shiftIP_subst >> bits) << bits);
             // multiply the random number between 0 and 1 with a mask of (2^n)-1:
-            random = (unsigned)((rand_r(&(pWrkrData->randstatus)) / (double)RAND_MAX) *
-                                ((1ull << (pWrkrData->pData->ipv4.bits)) - 1));
+            random = (unsigned)((rand_r(&(pWrkrData->randstatus)) / (double)RAND_MAX) * ((1ull << bits) - 1));
             return (unsigned)shiftIP_subst + random;
         case SIMPLE:  // can't happen, since this case is caught at the start of anonipv4()
         default:
@@ -786,6 +928,21 @@ static void getip(uchar *start, size_t end, char *address) {
 }
 
 /**
+ * \brief Log a warning when the unique retry limit is reached.
+ *
+ * \param addressType label for the address family (e.g., ipv4, ipv6).
+ * \param retryCount configured maximum retries.
+ * \param handling fallback behavior selected for max-retry handling.
+ */
+static void log_max_retry_warning(const char *addressType, unsigned int retryCount, enum maxRetryOption handling) {
+    const char *handlingLabel = handling == MAX_RETRY_ZERO ? "zero" : "accept-duplicates";
+
+    LogMsg(0, RS_RET_OK, LOG_WARNING,
+           "mmanon: unique retry limit %u reached for %s random-consistent-unique; handling=%s", retryCount,
+           addressType, handlingLabel);
+}
+
+/**
  * \brief Ensure consistent IPv4 anonymization for repeat callers.
  *
  * Walks or builds the IPv4 trie under a lock and stores the mapped replacement
@@ -800,11 +957,15 @@ static rsRetVal findip(char *address, wrkrInstanceData_t *pWrkrData) {
     DEFiRet;
     int i;
     unsigned num;
+    unsigned origNum;
     union node *current;
     union node *Last;
     int MoreLess;
     char *CurrentCharPtr;
+    uint32_t *uniqueKey = NULL;
     sbool locked = 0;
+    const int bits = pWrkrData->pData->ipv4.bits;
+    const enum mode anonmode = pWrkrData->pData->ipv4.mode;
 
     /*
      * Walk/construct the prefix trie for the incoming address. The last bit is
@@ -816,7 +977,8 @@ static rsRetVal findip(char *address, wrkrInstanceData_t *pWrkrData) {
     }
     locked = 1;
     current = pWrkrData->pData->ipv4.Root;
-    num = ipv42num(address);
+    origNum = ipv42num(address);
+    num = origNum;
     for (i = 0; i < 31; i++) {
         if (pWrkrData->pData->ipv4.Root == NULL) {
             CHKmalloc(current = (union node *)calloc(1, sizeof(union node)));
@@ -847,14 +1009,63 @@ static rsRetVal findip(char *address, wrkrInstanceData_t *pWrkrData) {
     if (CurrentCharPtr[0] != '\0') {
         strcpy(address, CurrentCharPtr);
     } else {
-        num = code_int(num, pWrkrData);
+        if (pWrkrData->pData->ipv4.randConsisUnique && pWrkrData->pData->ipv4.randConsisUniqueGeneratedIPs == NULL) {
+            CHKmalloc(pWrkrData->pData->ipv4.randConsisUniqueGeneratedIPs =
+                          create_hashtable(512, hash_from_u32, key_equals_u32, NULL));
+        }
+        unsigned int attempts = 0;
+        const sbool limitRetries = pWrkrData->pData->ipv4.limitMaxRetries;
+        const unsigned int maxRetries = pWrkrData->pData->ipv4.maxRetryCount;
+        const enum maxRetryOption handling = pWrkrData->pData->ipv4.maxRetryFallback;
+        sbool maxRetryReached = 0;
+        sbool duplicateFound = 0;
+
+        if (pWrkrData->pData->ipv4.randConsisUnique) {
+            do {
+                num = code_ipv4_int(origNum, pWrkrData, bits, anonmode);
+                duplicateFound = (hashtable_search(pWrkrData->pData->ipv4.randConsisUniqueGeneratedIPs, &num) != NULL);
+                if (duplicateFound) {
+                    if (limitRetries && attempts >= maxRetries) {
+                        maxRetryReached = 1;
+                        break;
+                    }
+                    attempts++;  // Retries count excludes the initial attempt, so increment after check.
+                }
+            } while (duplicateFound);
+        } else {
+            num = code_ipv4_int(origNum, pWrkrData, bits, anonmode);
+        }
+
+        if (maxRetryReached) {
+            log_max_retry_warning("ipv4", maxRetries, handling);
+            if (handling == MAX_RETRY_ZERO) {
+                num = code_ipv4_int(origNum, pWrkrData, bits, ZERO);
+                // duplicateFound determines whether the zeroed IP should be added to the table of unique generated IPs.
+                duplicateFound = (hashtable_search(pWrkrData->pData->ipv4.randConsisUniqueGeneratedIPs, &num) != NULL);
+            } else {
+                // Accept-duplicates keeps the last randomized IP; no extra work needed.
+            }
+        }
+
         num2ipv4(num, CurrentCharPtr);
+
+        if (pWrkrData->pData->ipv4.randConsisUnique && !duplicateFound) {
+            CHKmalloc(uniqueKey = (uint32_t *)malloc(sizeof(uint32_t)));
+            *uniqueKey = num;
+            if (!hashtable_insert(pWrkrData->pData->ipv4.randConsisUniqueGeneratedIPs, uniqueKey, (void *)1)) {
+                DBGPRINTF("hashtable error: insert to ipv4 unique table failed");
+                ABORT_FINALIZE(RS_RET_ERR);
+            }
+            uniqueKey = NULL;
+        }
+
         strcpy(address, CurrentCharPtr);
     }
 finalize_it:
     if (locked) {
         pthread_mutex_unlock(&pWrkrData->pData->ipv4Mutex);
     }
+    free(uniqueKey);
     RETiRet;
 }
 
@@ -875,7 +1086,7 @@ static void process_IPv4(char *address, wrkrInstanceData_t *pWrkrData) {
         findip(address, pWrkrData);
     } else {
         num = ipv42num(address);
-        num = code_int(num, pWrkrData);
+        num = code_ipv4_int(num, pWrkrData, pWrkrData->pData->ipv4.bits, pWrkrData->pData->ipv4.mode);
         num2ipv4(num, address);
     }
 }
@@ -979,14 +1190,11 @@ static void anonipv4(wrkrInstanceData_t *pWrkrData, uchar **msg, int *pLenMsg, i
  * \param pWrkrData worker context providing configuration and RNG state.
  * \param useEmbedded non-zero to use the embedded-IPv4 settings.
  */
-static void code_ipv6_int(struct ipv6_int *ip, wrkrInstanceData_t *pWrkrData, int useEmbedded) {
+static void code_ipv6_int(struct ipv6_int *ip, wrkrInstanceData_t *pWrkrData, int bits, enum mode anonmode) {
     unsigned long long randlow = 0;
     unsigned long long randhigh = 0;
     unsigned tmpRand;
     int fullbits;
-
-    int bits = useEmbedded ? pWrkrData->pData->embeddedIPv4.bits : pWrkrData->pData->ipv6.bits;
-    enum mode anonmode = useEmbedded ? pWrkrData->pData->embeddedIPv4.anonmode : pWrkrData->pData->ipv6.anonmode;
 
     /*
      * Apply the mask first, then optionally fill the cleared bits with random
@@ -1190,6 +1398,24 @@ static unsigned hash_from_key_fn(void *k) {
     return hashVal;
 }
 
+/**
+ * \brief Hash function for 32-bit IPv4 keys.
+ *
+ * Uses the numeric IPv4 value directly, which is already randomized, so the
+ * low bits provide sufficient entropy for the hash table.
+ */
+static unsigned hash_from_u32(void *k) {
+    const uint32_t key = *((uint32_t *)k);
+
+    return (unsigned)key;
+}
+
+/**
+ * \brief Key comparator for 32-bit IPv4 entries.
+ */
+static int key_equals_u32(void *key1, void *key2) {
+    return *((uint32_t *)key1) == *((uint32_t *)key2);
+}
 
 /**
  * \brief Convert split integers to an embedded-IPv4 textual address.
@@ -1218,6 +1444,37 @@ static void num2embedded(struct ipv6_int *ip, char *address) {
              (num[6] & 0xff00) >> 8, num[6] & 0xff, (num[7] & 0xff00) >> 8, num[7] & 0xff);
 }
 
+/**
+ * \brief Helper to generate a randomized IPv6/embedded address string.
+ *
+ * This helper is intentionally scoped to the findIPv6() retry loop, where
+ * all required preconditions and locking have already been validated. Do not
+ * use it elsewhere.
+ *
+ * \param num address value updated in place.
+ * \param original source address to randomize from.
+ * \param address buffer to receive the textual representation.
+ * \param pWrkrData worker context with RNG state.
+ * \param useEmbedded non-zero to format as embedded IPv4.
+ * \param bits number of bits to anonymize.
+ * \param anonmode anonymization mode to apply.
+ */
+static void generate_ipv6_candidate(struct ipv6_int *num,
+                                    const struct ipv6_int original,
+                                    char *address,
+                                    wrkrInstanceData_t *const pWrkrData,
+                                    int useEmbedded,
+                                    int bits,
+                                    enum mode anonmode) {
+    *num = original;
+    code_ipv6_int(num, pWrkrData, bits, anonmode);
+    if (useEmbedded) {
+        num2embedded(num, address);
+    } else {
+        num2ipv6(num, address);
+    }
+}
+
 
 /**
  * \brief Ensure consistent IPv6/embedded anonymization for repeat callers.
@@ -1234,8 +1491,28 @@ static void num2embedded(struct ipv6_int *ip, char *address) {
 static rsRetVal findIPv6(struct ipv6_int *num, char *address, wrkrInstanceData_t *const pWrkrData, int useEmbedded) {
     struct ipv6_int *hashKey = NULL;
     DEFiRet;
-    struct hashtable *hash = useEmbedded ? pWrkrData->pData->embeddedIPv4.hash : pWrkrData->pData->ipv6.hash;
+    struct hashtable *randConsisIPs =
+        useEmbedded ? pWrkrData->pData->embeddedIPv4.randConsisIPs : pWrkrData->pData->ipv6.randConsisIPs;
+    struct hashtable *randConsisUniqueGeneratedIPs = useEmbedded
+                                                         ? pWrkrData->pData->embeddedIPv4.randConsisUniqueGeneratedIPs
+                                                         : pWrkrData->pData->ipv6.randConsisUniqueGeneratedIPs;
+    const int uniqueMode =
+        useEmbedded ? pWrkrData->pData->embeddedIPv4.randConsisUnique : pWrkrData->pData->ipv6.randConsisUnique;
+    struct ipv6_int original = *num;
+    struct ipv6_int *uniqueKey = NULL;
     sbool locked = 0;
+    const sbool limitRetries =
+        useEmbedded ? pWrkrData->pData->embeddedIPv4.limitMaxRetries : pWrkrData->pData->ipv6.limitMaxRetries;
+    const unsigned int maxRetries =
+        useEmbedded ? pWrkrData->pData->embeddedIPv4.maxRetryCount : pWrkrData->pData->ipv6.maxRetryCount;
+    const enum maxRetryOption handling =
+        useEmbedded ? pWrkrData->pData->embeddedIPv4.maxRetryFallback : pWrkrData->pData->ipv6.maxRetryFallback;
+    unsigned int attempts = 0;
+    sbool maxRetryReached = 0;
+    sbool duplicateFound = 0;
+    const char *addressType = useEmbedded ? "embeddedipv4" : "ipv6";
+    const int bits = useEmbedded ? pWrkrData->pData->embeddedIPv4.bits : pWrkrData->pData->ipv6.bits;
+    const enum mode anonmode = useEmbedded ? pWrkrData->pData->embeddedIPv4.anonmode : pWrkrData->pData->ipv6.anonmode;
 
     /*
      * Consistent randomization keeps a per-action hash table of original->
@@ -1248,46 +1525,84 @@ static rsRetVal findIPv6(struct ipv6_int *num, char *address, wrkrInstanceData_t
     }
     locked = 1;
 
-    if (hash == NULL) {
-        CHKmalloc(hash = create_hashtable(512, hash_from_key_fn, keys_equal_fn, NULL));
+    if (randConsisIPs == NULL) {
+        CHKmalloc(randConsisIPs = create_hashtable(512, hash_from_key_fn, keys_equal_fn, NULL));
         if (useEmbedded) {
-            pWrkrData->pData->embeddedIPv4.hash = hash;
+            pWrkrData->pData->embeddedIPv4.randConsisIPs = randConsisIPs;
         } else {
-            pWrkrData->pData->ipv6.hash = hash;
+            pWrkrData->pData->ipv6.randConsisIPs = randConsisIPs;
         }
     }
 
-    char *val = (char *)(hashtable_search(hash, num));
+    if (uniqueMode && randConsisUniqueGeneratedIPs == NULL) {
+        CHKmalloc(randConsisUniqueGeneratedIPs = create_hashtable(512, hash_from_key_fn, keys_equal_fn, NULL));
+        if (useEmbedded) {
+            pWrkrData->pData->embeddedIPv4.randConsisUniqueGeneratedIPs = randConsisUniqueGeneratedIPs;
+        } else {
+            pWrkrData->pData->ipv6.randConsisUniqueGeneratedIPs = randConsisUniqueGeneratedIPs;
+        }
+    }
+
+    char *val = (char *)(hashtable_search(randConsisIPs, num));
 
     if (val != NULL) {
         strcpy(address, val);
     } else {
         CHKmalloc(hashKey = (struct ipv6_int *)malloc(sizeof(struct ipv6_int)));
-        hashKey->low = num->low;
-        hashKey->high = num->high;
+        *hashKey = original;
 
-        if (useEmbedded) {
-            code_ipv6_int(num, pWrkrData, 1);
-            num2embedded(num, address);
+        if (uniqueMode) {
+            do {
+                generate_ipv6_candidate(num, original, address, pWrkrData, useEmbedded, bits, anonmode);
+                duplicateFound = (hashtable_search(randConsisUniqueGeneratedIPs, num) != NULL);
+                if (duplicateFound) {
+                    if (limitRetries && attempts >= maxRetries) {
+                        maxRetryReached = 1;
+                        break;
+                    }
+                    attempts++;  // Retries count excludes the initial attempt, so increment after check.
+                }
+            } while (duplicateFound);
         } else {
-            code_ipv6_int(num, pWrkrData, 0);
-            num2ipv6(num, address);
+            generate_ipv6_candidate(num, original, address, pWrkrData, useEmbedded, bits, anonmode);
+        }
+
+        if (maxRetryReached) {
+            log_max_retry_warning(addressType, maxRetries, handling);
+            if (handling == MAX_RETRY_ZERO) {
+                generate_ipv6_candidate(num, original, address, pWrkrData, useEmbedded, bits, ZERO);
+                // duplicateFound determines whether the zeroed IP should be added to the table of unique generated IPs.
+                duplicateFound = (hashtable_search(randConsisUniqueGeneratedIPs, num) != NULL);
+            } else {
+                // Accept-duplicates keeps the last randomized IP; no extra work needed.
+            }
         }
         char *hashString;
         CHKmalloc(hashString = strdup(address));
 
-        if (!hashtable_insert(hash, hashKey, hashString)) {
+        if (!hashtable_insert(randConsisIPs, hashKey, hashString)) {
             DBGPRINTF("hashtable error: insert to %s-table failed", useEmbedded ? "embedded ipv4" : "ipv6");
             free(hashString);
             ABORT_FINALIZE(RS_RET_ERR);
         }
         hashKey = NULL;
+
+        if (uniqueMode && !duplicateFound) {
+            CHKmalloc(uniqueKey = (struct ipv6_int *)malloc(sizeof(struct ipv6_int)));
+            *uniqueKey = *num;
+            if (!hashtable_insert(randConsisUniqueGeneratedIPs, uniqueKey, (void *)1)) {
+                DBGPRINTF("hashtable error: insert to %s unique table failed", useEmbedded ? "embedded ipv4" : "ipv6");
+                ABORT_FINALIZE(RS_RET_ERR);
+            }
+            uniqueKey = NULL;
+        }
     }
 finalize_it:
     if (locked) {
         pthread_mutex_unlock(&pWrkrData->pData->ipv6Mutex);
     }
     free(hashKey);
+    free(uniqueKey);
     RETiRet;
 }
 
@@ -1310,7 +1625,7 @@ static void process_IPv6(char *address, wrkrInstanceData_t *pWrkrData, const siz
     if (pWrkrData->pData->ipv6.randConsis) {
         findIPv6(&num, address, pWrkrData, 0);
     } else {
-        code_ipv6_int(&num, pWrkrData, 0);
+        code_ipv6_int(&num, pWrkrData, pWrkrData->pData->ipv6.bits, pWrkrData->pData->ipv6.anonmode);
         num2ipv6(&num, address);
     }
 }
@@ -1550,7 +1865,7 @@ static void process_embedded(char *address, wrkrInstanceData_t *pWrkrData, size_
     if (pWrkrData->pData->embeddedIPv4.randConsis) {
         findIPv6(&num, address, pWrkrData, 1);
     } else {
-        code_ipv6_int(&num, pWrkrData, 1);
+        code_ipv6_int(&num, pWrkrData, pWrkrData->pData->embeddedIPv4.bits, pWrkrData->pData->embeddedIPv4.anonmode);
         num2embedded(&num, address);
     }
 }

@@ -249,7 +249,9 @@ enum cnffuncid {
     CNFFUNC_PREVIOUS_ACTION_SUSPENDED,
     CNFFUNC_SCRIPT_ERROR,
     CNFFUNC_HTTP_REQUEST,
-    CNFFUNC_IS_TIME
+    CNFFUNC_IS_TIME,
+    CNFFUNC_SPLIT,
+    CNFFUNC_APPEND_JSON
 };
 
 typedef struct cnffunc cnffunc_t;

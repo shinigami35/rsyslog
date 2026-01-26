@@ -208,7 +208,6 @@ typedef struct instanceConf_s {
     sbool *serverSuspended;   /* Array: Is server N globally suspended? */
     time_t *serverNextRetry;  /* Array: When can we try server N again? */
     pthread_mutex_t mutGlobalState; /* Protects these arrays */
-
 } instanceData;
 
 struct modConfData_s {
@@ -612,102 +611,6 @@ static inline void incrementServerIndex(wrkrInstanceData_t *pWrkrData) {
 }
 
 
-/* checks if connection to ES can be established; also iterates over
- * potential servers to support high availability (HA) feature. If it
- * needs to switch server, will record new one in curl handle.
- */
-/*static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
-    CURL *curl = NULL;
-    CURLcode res;
-    es_str_t *urlBuf = NULL;
-    char *healthUrl = NULL;
-    char *serverUrl = NULL;
-    char *checkPath = NULL;
-    int i;
-    int r;
-    DEFiRet;
-
-    if (pWrkrData->pData->checkPath == NULL) {
-        DBGPRINTF("omhttp: checkConn no health check uri configured skipping it\n");
-        FINALIZE;
-    }
-
-    time_t now = time(NULL);
-    time_t lastCheckServer = pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->lastCheck;
-    if (lastCheckServer != NULL && pWrkrData->pData->healthCheckTimeDelay != -1) {
-        if (lastCheckServer != 0 && now < (lastCheckServer + pWrkrData->pData->healthCheckTimeDelay)) {
-            DBGPRINTF("omhttp: health check for server %d skipped due to healthCheckTimeDelay\n",
-                      pWrkrData->serverIndex);
-            ABORT_FINALIZE(RS_RET_OK);
-        }
-    }
-
-    pWrkrData->reply = NULL;
-    pWrkrData->replyLen = 0;
-    urlBuf = es_newStr(256);
-    if (urlBuf == NULL) {
-        LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to allocate buffer for health check uri.");
-        ABORT_FINALIZE(RS_RET_SUSPENDED);
-    }
-
-    for (i = 0; i < pWrkrData->pData->numServers; ++i) {
-        // TODO : Check if curl Object contains all info
-        // resCurl = curl_easy_getinfo(serverData->curlPostHandle, CURLINFO_REQUEST_SIZE, &req);
-        if(pWrkrData->listServerDataWkr[i]->curlCheckConnHandle != NULL
-           && pWrkrData->listServerDataWkr[i]->fullUrlHealth != NULL) {
-            curl = pWrkrData->listServerDataWkr[i]->curlCheckConnHandle;
-        }
-        if (curl == NULL) {
-            curl = pWrkrData->listServerDataWkr[i]->curlCheckConnHandle;
-            serverUrl = (char *)pWrkrData->pData->serverBaseUrls[pWrkrData->serverIndex];
-            checkPath = (char *)pWrkrData->pData->checkPath;
-
-            es_emptyStr(urlBuf);
-            r = es_addBuf(&urlBuf, serverUrl, strlen(serverUrl));
-            if (r == 0 && checkPath != NULL) r = es_addBuf(&urlBuf, checkPath, strlen(checkPath));
-            if (r == 0) healthUrl = es_str2cstr(urlBuf, NULL);
-            if (r != 0 || healthUrl == NULL) {
-                LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to allocate buffer for health check uri.");
-                ABORT_FINALIZE(RS_RET_SUSPENDED);
-            }
-
-            curlCheckConnSetup(pWrkrData, pWrkrData->listServerDataWkr[i]);
-
-            curl_easy_setopt(curl, CURLOPT_URL, healthUrl);
-
-            pWrkrData->listServerDataWkr[i]->fullUrlHealth = (uchar *)healthUrl;
-            DBGPRINTF("omhttp: checkConn URL is : %s\n", pWrkrData->listServerDataWkr[i]->fullUrlHealth);
-            pWrkrData->listServerDataWkr[i]->curlCheckConnHandle = curl;
-            //if (healthUrl != NULL) free(healthUrl);
-        }
-        DBGPRINTF("omhttp: checkConn launch request : %d\n", (i +1) );
-        DBGPRINTF("omhttp: checkConn URL is : %s\n", pWrkrData->listServerDataWkr[i]->fullUrlHealth);
-        res = curl_easy_perform(curl);
-
-        if (res == CURLE_OK) {
-            // Update last check if OK
-            pWrkrData->listServerDataWkr[i]->lastCheck = now;
-            DBGPRINTF(
-                "omhttp: checkConn %s completed with success "
-                "on attempt %d\n",
-                serverUrl, i);
-            ABORT_FINALIZE(RS_RET_OK);
-        }
-
-        DBGPRINTF("omhttp: checkConn %s failed on attempt %d: %s\n", serverUrl, i, curl_easy_strerror(res));
-        incrementServerIndex(pWrkrData);
-    }
-
-    LogMsg(0, RS_RET_SUSPENDED, LOG_WARNING, "omhttp: checkConn failed after %d attempts.", i);
-    ABORT_FINALIZE(RS_RET_SUSPENDED);
-
-finalize_it:
-    if (urlBuf != NULL) es_deleteStr(urlBuf);
-
-    free(pWrkrData->reply);
-    pWrkrData->reply = NULL; // don't leave dangling pointer 
-    RETiRet;
-}*/
 static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 	instanceData *pData = pWrkrData->pData;
     CURLcode res;
@@ -2763,6 +2666,8 @@ BEGINnewActInst
     if (servers != NULL) {
         pData->numServers = servers->nmemb;
         pData->serverBaseUrls = malloc(servers->nmemb * sizeof(uchar *));
+        CHKmalloc(pData->lastHealthCheck = calloc(pData->numServers, sizeof(time_t)));
+
         if (pData->serverBaseUrls == NULL) {
             LogError(0, RS_RET_ERR,
                      "omhttp: unable to allocate buffer "
@@ -2805,16 +2710,28 @@ BEGINnewActInst
             free(serverParam);
             serverParam = NULL;
         }
+
     } else {
         LogMsg(0, RS_RET_OK, LOG_WARNING, "omhttp: No servers specified, using localhost");
         pData->numServers = 1;
         pData->serverBaseUrls = malloc(sizeof(uchar *));
+        CHKmalloc(pData->lastHealthCheck = calloc(1, sizeof(time_t)));
         if (pData->serverBaseUrls == NULL) {
             LogError(0, RS_RET_ERR,
                      "omhttp: unable to allocate buffer "
                      "for http server configuration.");
             ABORT_FINALIZE(RS_RET_ERR);
         }
+
+        pData->listObjStats = malloc(sizeof(targetStats_t));
+        if (pData->listObjStats == NULL) {
+            LogError(0, RS_RET_ERR,
+                     "omhttp: unable to allocate buffer "
+                     "for http server stats object.");
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
+        CHKiRet(setStatsObject(pData, NULL, 0));
+
         CHKiRet(computeBaseUrl("localhost", pData->defaultPort, pData->useHttps, pData->serverBaseUrls));
     }
 

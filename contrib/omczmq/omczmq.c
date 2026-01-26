@@ -176,6 +176,9 @@ static rsRetVal initCZMQ(instanceData *pData) {
 
     switch (pData->sockType) {
         case ZMQ_PUB:
+/* ZMQ_RADIO socket type is available and stable in all czmq versions that
+ * define it. The previous version restriction (< 4.2.0) was incorrect and
+ * has been removed. */
 #if defined(ZMQ_RADIO)
         case ZMQ_RADIO:
 #endif
@@ -231,6 +234,7 @@ static rsRetVal outputCZMQ(uchar **ppString, instanceData *pData) {
 
     /* if we are using a PUB (or RADIO) socket and we have a topic list then we
      * need some special care and attention */
+/* ZMQ_RADIO socket type support - available in all czmq versions that define it */
 #if defined(ZMQ_RADIO)
     DBGPRINTF("omczmq: ZMQ_RADIO is defined...\n");
     if ((pData->sockType == ZMQ_PUB || pData->sockType == ZMQ_RADIO) && pData->topics) {
@@ -264,6 +268,7 @@ static rsRetVal outputCZMQ(uchar **ppString, instanceData *pData) {
                     ABORT_FINALIZE(RS_RET_SUSPENDED);
                 }
             }
+/* ZMQ_RADIO socket type support - available in all czmq versions that define it */
 #if defined(ZMQ_RADIO)
             else if (pData->sockType == ZMQ_RADIO) {
                 DBGPRINTF("omczmq: sending on RADIO socket...\n");
@@ -521,6 +526,7 @@ BEGINnewActInst
                     pData->sockType = ZMQ_PUB;
                     DBGPRINTF("omczmq: sockType set to ZMQ_PUB\n");
                 }
+/* ZMQ_RADIO socket type support - available in all czmq versions that define it */
 #if defined(ZMQ_RADIO)
                 else if (!strcmp("RADIO", stringType)) {
                     pData->sockType = ZMQ_RADIO;

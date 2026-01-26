@@ -93,7 +93,7 @@ fi
 # modules we require
 PKG_CHECK_MODULES(LIBESTR, libestr >= 0.1.9)
 
-PKG_CHECK_MODULES([LIBFASTJSON], [libfastjson >= 0.99.8],,)
+PKG_CHECK_MODULES([LIBFASTJSON], [libfastjson >= 0.99.9],,)
 
 AC_DEFINE_UNQUOTED([PLATFORM_ID], ["${host}"], [platform id for display purposes])
 # we don't mind if we don't have the lsb_release utility. But if we have, it's
@@ -245,6 +245,18 @@ AM_CONDITIONAL(ENABLE_INOTIFY, test x$rsyslog_sysinotify = xyes -a x$rsyslog_ino
 
 # getifaddrs is in libc (mostly) or in libsocket (eg Solaris 11) or not defined (eg Solaris 10)
 AC_SEARCH_LIBS([getifaddrs], [socket], [AC_DEFINE(HAVE_GETIFADDRS, [1], [set define])])
+
+AC_CHECK_HEADERS([arpa/nameser.h resolv.h])
+AC_SEARCH_LIBS([ns_initparse], [resolv])
+LIBRESOLV_LIBS=$ac_cv_search_ns_initparse
+AS_CASE([$LIBRESOLV_LIBS],
+        ["none required"], [LIBRESOLV_LIBS=""],
+        ["no"], [LIBRESOLV_LIBS=""])
+AC_SUBST([LIBRESOLV_LIBS])
+AS_IF([test "x$ac_cv_search_ns_initparse" != "xno"],
+      [AC_DEFINE([HAVE_RESOLV_NS_INITPARSE], [1],
+                 [Define if resolver provides ns_initparse])])
+AM_CONDITIONAL([HAVE_SRV_DISCOVERY], [test "x$ac_cv_search_ns_initparse" != "xno"])
 
 # the check below is probably ugly. If someone knows how to do it in a better way, please
 # let me know! -- rgerhards, 2010-10-06
@@ -1179,6 +1191,42 @@ AC_ARG_ENABLE(clickhouse_tests,
 )
 AM_CONDITIONAL(ENABLE_CLICKHOUSE_TESTS, test x$enable_clickhouse_tests = xyes)
 
+AC_DEFUN([RSYSLOG_CHECK_OPENSSL_FOR_PROTON], [
+	# Proton requires OpenSSL for SSL/TLS support. Ensure OpenSSL is available.
+	# If OPENSSL_LIBS is not already set (from --enable-openssl), detect it now.
+	if test "x$OPENSSL_LIBS" = "x"; then
+		PKG_CHECK_MODULES(OPENSSL, openssl)
+	fi
+])
+
+AC_SUBST(WOLFSSL_CFLAGS)
+AC_SUBST(WOLFSSL_LIBS)
+AC_ARG_ENABLE(wolfssl,
+    AS_HELP_STRING([--enable-wolfssl@<:@=DIR@:>@],
+		   [Enable wolfssl support @<:@default=no@:>@]),
+[
+	case "${enableval}" in
+		yes)
+			PKG_CHECK_MODULES(WOLFSSL, wolfssl)
+			;;
+		no)
+			enable_wolfssl=no
+			;;
+		*)
+			WOLFSSL_CFLAGS="-I${enableval}/include/wolfssl -I${enableval}/include"
+			WOLFSSL_LIBS="-L${enableval}/lib -lwolfssl"
+			;;
+	esac
+	if test "x$enable_wolfssl" != "xno"; then
+		enable_wolfssl=yes
+		AC_DEFINE([ENABLE_WOLFSSL], [1], [Indicator that wolfssl is present])
+		AC_DEFINE([ENABLE_OSSL], [1], [Indicator that ossl driver is present])
+	fi
+],
+[
+	enable_wolfssl=no
+])
+AM_CONDITIONAL(ENABLE_WOLFSSL, [test "x$enable_wolfssl" = "xyes"])
 
 # openssl support
 AC_ARG_ENABLE(openssl,
@@ -1193,9 +1241,14 @@ AC_ARG_ENABLE(openssl,
 if test "x$enable_openssl" = "xyes"; then
 	PKG_CHECK_MODULES(OPENSSL, openssl)
 	AC_DEFINE([ENABLE_OPENSSL], [1], [Indicator that openssl is present])
+	AC_DEFINE([ENABLE_OSSL], [1], [Indicator that ossl driver is present])
 	save_libs=$LIBS
 fi
-AM_CONDITIONAL(ENABLE_OPENSSL, test x$enable_openssl = xyes)
+if test "x$enable_wolfssl" = "xyes" && test "x$enable_openssl" = "xyes"; then
+	AC_MSG_ERROR([wolfSSL and OpenSSL cannot be enabled together; select only one])
+fi
+AM_CONDITIONAL(ENABLE_OPENSSL, [test "x$enable_openssl" = "xyes"])
+AM_CONDITIONAL(ENABLE_OSSL, [test "x$enable_openssl" = "xyes" || test "x$enable_wolfssl" = "xyes"])
 
 AC_ARG_ENABLE(openssl_crypto_provider,
         [AS_HELP_STRING([--enable-opensslcrypto],[Enable openssl crypto provider @<:@default=no@:>@])],
@@ -2246,16 +2299,16 @@ AM_CONDITIONAL(ENABLE_IMPTCP, test x$enable_imptcp = xyes)
 
 
 # settings for the pstats input module
+impstats_user_set=no
 AC_ARG_ENABLE(impstats,
         [AS_HELP_STRING([--enable-impstats],[periodic statistics module enabled @<:@default=no@:>@])],
         [case "${enableval}" in
-         yes) enable_impstats="yes" ;;
-          no) enable_impstats="no" ;;
+         yes) enable_impstats="yes"; impstats_user_set=yes ;;
+          no) enable_impstats="no"; impstats_user_set=yes ;;
            *) AC_MSG_ERROR(bad value ${enableval} for --enable-impstats) ;;
          esac],
         [enable_impstats=no]
 )
-AM_CONDITIONAL(ENABLE_IMPSTATS, test x$enable_impstats = xyes)
 
 # settings for the pcap input module
 AC_ARG_ENABLE(impcap,
@@ -2358,6 +2411,12 @@ if test "x$enable_testbench" = "xyes"; then
 		AC_MSG_NOTICE([--enable-testbench auto-enabling omstdout])
 		enable_omstdout="yes"
 	fi
+	if test "x$enable_impstats" != "xyes"; then
+		if test "x$impstats_user_set" != "xyes"; then
+			AC_MSG_NOTICE([--enable-testbench auto-enabling impstats])
+			enable_impstats="yes"
+		fi
+	fi
 fi
 
 if test "x$enable_imdiag" = "xyes"; then
@@ -2365,6 +2424,7 @@ if test "x$enable_imdiag" = "xyes"; then
 fi
 AM_CONDITIONAL(ENABLE_IMDIAG, test x$enable_imdiag = xyes)
 AM_CONDITIONAL(ENABLE_OMSTDOUT, test x$enable_omstdout = xyes)
+AM_CONDITIONAL(ENABLE_IMPSTATS, test x$enable_impstats = xyes)
 AM_CONDITIONAL(ENABLE_TESTBENCH, test x$enable_testbench = xyes)
 
 
@@ -2565,23 +2625,23 @@ if test "x$enable_omhdfs"; then
 fi
 AM_CONDITIONAL(ENABLE_OMHDFS, test x$enable_omhdfs = xyes)
 
-AC_ARG_ENABLE(omotlp,
-        [AS_HELP_STRING([--enable-omotlp],[Enable OpenTelemetry output module @<:@default=no@:>@])],
+AC_ARG_ENABLE(omotel,
+        [AS_HELP_STRING([--enable-omotel],[Enable OpenTelemetry output module @<:@default=no@:>@])],
         [case "${enableval}" in
-         yes) enable_omotlp="yes" ;;
-          no) enable_omotlp="no" ;;
-            *) AC_MSG_ERROR(bad value ${enableval} for --enable-omotlp) ;;
+         yes) enable_omotel="yes" ;;
+          no) enable_omotel="no" ;;
+            *) AC_MSG_ERROR(bad value ${enableval} for --enable-omotel) ;;
          esac],
-        [enable_omotlp=no]
+        [enable_omotel=no]
 )
-OMOTLP_HTTP_CFLAGS=""
-OMOTLP_HTTP_LIBS=""
-if test "x$enable_omotlp" = "xyes"; then
-        PKG_CHECK_MODULES([OMOTLP_HTTP], [libcurl libfastjson])
+OMOTEL_HTTP_CFLAGS=""
+OMOTEL_HTTP_LIBS=""
+if test "x$enable_omotel" = "xyes"; then
+        PKG_CHECK_MODULES([OMOTEL_HTTP], [libcurl libfastjson])
 fi
-AC_SUBST([OMOTLP_HTTP_CFLAGS])
-AC_SUBST([OMOTLP_HTTP_LIBS])
-AM_CONDITIONAL(ENABLE_OMOTLP, test x$enable_omotlp = xyes)
+AC_SUBST([OMOTEL_HTTP_CFLAGS])
+AC_SUBST([OMOTEL_HTTP_LIBS])
+AM_CONDITIONAL(ENABLE_OMOTEL, test x$enable_omotel = xyes)
 
 # support for kafka input output
 AC_ARG_ENABLE(omkafka,
@@ -2754,6 +2814,7 @@ if test "x$enable_omazureeventhubs" = "xyes"; then
         PKG_CHECK_MODULES(PROTON_PROACTOR, libqpid-proton-proactor >= 0.13)
         AC_SUBST(PROTON_PROACTOR_CFLAGS)
         AC_SUBST(PROTON_PROACTOR_LIBS)
+        RSYSLOG_CHECK_OPENSSL_FOR_PROTON
 fi
 AM_CONDITIONAL(ENABLE_OMAZUREEVENTHUBS, test x$enable_omazureeventhubs = xyes)
 # END PROTON
@@ -2836,6 +2897,12 @@ fi
 AM_CONDITIONAL(ENABLE_OMDTLS, test x$enable_omdtls = xyes)
 # END OMDTLS INPUT
 
+if test "x$enable_wolfssl" = "xyes"; then
+	if test "x$enable_imdtls" = "xyes" -o "x$enable_omdtls" = "xyes"; then
+		AC_MSG_ERROR([DTLS modules (imdtls/omdtls) require OpenSSL; they cannot be built with wolfSSL enabled])
+	fi
+fi
+
 
 # BEGIN CZMQ INPUT SUPPORT
 AC_ARG_ENABLE(imczmq,
@@ -2887,6 +2954,10 @@ if test "x$enable_omrabbitmq" = "xyes"; then
         PKG_CHECK_MODULES(RABBITMQ, librabbitmq >= 0.2.0)
         AC_SUBST(RABBITMQ_CFLAGS)
         AC_SUBST(RABBITMQ_LIBS)
+        # Check which header path is used by rabbitmq-c (0.8.0+ uses rabbitmq-c/ prefix)
+        AC_CHECK_HEADER([rabbitmq-c/amqp.h],
+                [AC_DEFINE([HAVE_RABBITMQ_C_AMQP_H], [1], [Define if rabbitmq-c/amqp.h exists (rabbitmq-c 0.8.0+)])],
+                [])
 fi
 AM_CONDITIONAL(ENABLE_OMRABBITMQ, test x$enable_omrabbitmq = xyes)
 
@@ -3064,6 +3135,7 @@ if test "x$enable_omamqp1" = "xyes"; then
         PKG_CHECK_MODULES(PROTON, libqpid-proton >= 0.13)
         AC_SUBST(PROTON_CFLAGS)
         AC_SUBST(PROTON_LIBS)
+        RSYSLOG_CHECK_OPENSSL_FOR_PROTON
 fi
 AM_CONDITIONAL(ENABLE_OMAMQP1, test x$enable_omamqp1 = xyes)
 
@@ -3195,7 +3267,54 @@ if test "x$have_to_generate_man_pages" = "xyes" && test "x$RST2MAN" = "xfalse"; 
         AC_MSG_ERROR([rst2man is required when building from git source or --enable-generate-man-pages option was set, please install python-docutils.])
 fi
 
+
+dnl ---- gather doc files for EXTRA_DIST ----
+# .rst files and selected assets from doc/source
+doc_src_files=`cd "$srcdir" && find doc/source -type f \( -name '*.rst' -o -name '*.conf' -o -name '*.jpg' -o -name '*.png' -o -name '*.svg' \) -print 2>/dev/null | LC_ALL=C sort`
+
+# Additional doc assets that must be shipped in dist tarball
+# - Vendored static JS/CSS used by the docs
+doc_vendor_files=`cd "$srcdir" && find doc/source/_static/vendor -type f -print 2>/dev/null | LC_ALL=C sort`
+# - Documentation build helper scripts and tools
+doc_tools_files=`cd "$srcdir" && find doc/tools -type f -print 2>/dev/null | LC_ALL=C sort`
+
+# assemble; keep paths relative to top (we cd into $srcdir above)
+DOC_FILES="$doc_src_files
+$doc_vendor_files
+$doc_tools_files
+doc/source/conf.py
+doc/source/conf_helpers.py
+doc/source/_ext/edit_on_github.py
+doc/source/_ext/rsyslog_lexer.py
+doc/source/_static/rsyslog.css
+doc/source/tutorials/cert-script.tar.gz
+doc/ai/structure_and_paths.md
+doc/ai/authoring_guidelines.md
+doc/ai/chunking_and_embeddings.md
+doc/ai/crosslinking_and_nav.md
+doc/ai/drift_monitoring.md
+doc/ai/mermaid_rules.md
+doc/ai/README.md
+doc/ai/templates/template-concept.rst
+doc/ai/templates/template-tutorial.rst
+doc/ai/terminology.md
+doc/ai/module_map.yaml
+doc/requirements.txt
+doc/README.md
+doc/STRATEGY.md
+doc/CONTRIBUTING.md
+doc/LICENSE
+doc/Makefile
+$ai_files"
+
+# collapse newlines and extra whitespace to single spaces
+DOC_FILES=`printf "%s\n" "$DOC_FILES" | awk 'NF' | tr '\n' ' '`
+
+AC_SUBST([DOC_FILES])
+
+
 AC_CONFIG_FILES([Makefile \
+		doc/Makefile \
 		runtime/Makefile \
 		compat/Makefile \
 		grammar/Makefile \
@@ -3209,7 +3328,7 @@ AC_CONFIG_FILES([Makefile \
 		plugins/immark/Makefile \
 		plugins/imklog/Makefile \
                 plugins/omhdfs/Makefile \
-                plugins/omotlp/Makefile \
+                plugins/omotel/Makefile \
                 plugins/omkafka/Makefile \
 		plugins/omprog/Makefile \
 		plugins/mmexternal/Makefile \
@@ -3358,7 +3477,7 @@ echo "    omstdout module will be compiled:         $enable_omstdout"
 echo "    omsendertrack module will be compiled:    $enable_omsendertrack"
 echo "    omjournal module will be compiled:        $enable_omjournal"
 echo "    omhdfs module will be compiled:           $enable_omhdfs"
-echo "    omotlp module will be compiled:           $enable_omotlp"
+echo "    omotel module will be compiled:           $enable_omotel"
 echo "    omelasticsearch module will be compiled:  $enable_elasticsearch"
 echo "    omclickhouse module will be compiled:     $enable_clickhouse"
 echo "    omhttp module will be compiled:           $enable_omhttp"
@@ -3419,6 +3538,7 @@ echo "    hiredis support enabled:                  $enable_omhiredis"
 echo
 echo "---{ protocol support }---"
 echo "    openssl network stream driver enabled:    $enable_openssl"
+echo "    wolfssl network stream driver enabled:    $enable_wolfssl"
 echo "    GnuTLS network stream driver enabled:     $enable_gnutls"
 echo "    Mbed TLS network stream driver enabled:   $enable_mbedtls"
 echo "    GSSAPI Kerberos 5 support enabled:        $enable_gssapi_krb5"

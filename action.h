@@ -4,7 +4,7 @@
  * File begun on 2007-08-06 by RGerhards (extracted from syslogd.c, which
  * was under BSD license at the time of rsyslog fork)
  *
- * Copyright 2007-2018 Adiscon GmbH.
+ * Copyright 2007-2026 Adiscon GmbH.
  *
  * This file is part of rsyslog.
  *
@@ -111,6 +111,7 @@ struct action_s {
     /* for statistics subsystem */
     statsobj_t *statsobj;
     STATSCOUNTER_DEF(ctrProcessed, mutCtrProcessed)
+    STATSCOUNTER_DEF(ctrBatchesProcessed, mutCtrBatchesProcessed)
     STATSCOUNTER_DEF(ctrFail, mutCtrFail)
     STATSCOUNTER_DEF(ctrSuspend, mutCtrSuspend)
     STATSCOUNTER_DEF(ctrSuspendDuration, mutCtrSuspendDuration)
@@ -189,5 +190,8 @@ void actionRemoveWorker(action_t *const pAction, void *const actWrkrData);
 
 /** Release parameter memory allocated by prepareDoActionParams(). */
 void releaseDoActionParams(action_t *const pAction, wti_t *const pWti, int action_destruct);
+
+/** Return the action name; never returns NULL. */
+const uchar *actionGetName(const action_t *const pAction);
 
 #endif /* #ifndef ACTION_H_INCLUDED */

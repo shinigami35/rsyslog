@@ -1,7 +1,334 @@
-----------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
 Scheduled Release 8.2602.0 (aka 2026.02) 2026-12-??
 - overall improved documentation via a large set of topic updates.
 
+- 2026-01-25: Add support healthchecktimedelay into omhttp
+  This PR add the possibility to set up a time to delay the check
+  of an "API health URL" to avoid multi request to an API.
+  In some case, when you use the omhttp module to send massive
+  volume of data to an API, the check of the API status does not
+  need to be done at each post request. This parameter allow to
+  set up a delay between two check of the API health URL.
+  Thanks to github user shinigami35 for the patch.
+- 2026-01-24: AI: added improved AI agent skills
+  Added skills, so that AI agents will hopefully follow instructions and
+  rsyslog workflow better. Adapted AGENTS.md to support them. First results
+  look very promising, so merged to main branch.
+- 2026-01-24: testbench: refactor Makefile.am; factor test lists, fix dist
+  Reduce Makefile clutter and make the test harness easier to reason
+  about for humans and machines. This also aims to lower CI flakes by
+  making the dist artifact complete and predictable.
+  Impact: build/test harness only; no runtime change. New
+  TEST_RUN_TYPE=MOCK-OK opt-in fast path in diag.sh.
+  Before: many scattered conditional TESTS entries; some scripts were
+  only in EXTRA_DIST when corresponding features were enabled, leading
+  to missing files in "make dist*" tarballs. Duplicates existed.
+  After: conditional test lists are grouped into variables (e.g.,
+  TESTS_ELASTICSEARCH_MINIMAL) and appended to TESTS under the same
+  conditionals; all lists are always added to EXTRA_DIST. Duplicate
+  entries removed. diag.sh recognizes TEST_RUN_TYPE=MOCK-OK for mock
+  distchecks and exits success without executing.
+- 2026-01-24: imfile: add inotify fallback rescans on watch limits
+  Graceful degradation when watch limits are reached avoids a hard stop
+  and keeps logs flowing in constrained environments.
+  Inotify watch setup now marks limit hits and schedules retry scans.
+  Fallback scans re-walk the tree and rearm missing watches, then
+  disable fallback once all watches are active.
+  The fallback interval is configurable and bounded to avoid overflow.
+  Docs add the new parameter and clarify watch-limit behavior.
+- 2026-01-20: impstats/dynstats: add opt-in state persistence
+  Operators want dynstats to survive restarts for consistent metrics and
+  smoother observability in containers and rolling deploys.
+  Before: dynstats buckets were ephemeral; restarts reset counters.
+  After: optional on-disk persistence restores counters; worker thread is
+  started on demand and torn down with the owning rsconf.
+  Impact: New state files under WorkDirectory (or statefile.directory)
+  when enabled; slight I/O overhead on configured thresholds. Defaults
+  preserve previous behavior (persistence off).
+  Thanks to github user n2yen for the initial prototype patch.
+- 2026-01-19: ossl: add experimental OCSP certificate revocation checking support
+  This implements certificate revocation checking using OCSP (RFC 6960)
+  for the OpenSSL network stream driver. The feature is disabled by
+  default and can be enabled via the new StreamDriver.TlsRevocationCheck
+  configuration parameter.
+  This is a rebased and refactored version of the original implementation
+  by Daniel Gollub from June 2020, updated to work with the current main
+  branch and enhanced with proper plumbing, security hardening, tests,
+  and documentation.
+  Note: this is experimental, the OCSP request does NOT run asynchronously.
+  As such, it can block rsyslog threads for some seconds, which may not be
+  suitable for all applications. See documentation for full details.
+  Upcoming work is expected to improve the state.
+  Thanks to Daniel Gollub for the patch.
+- 2026-01-19:
+- 2026-01-17: make mmutf8fix work also on tags
+  Thanks to Jan Jeroným Zvánovec for the base patch, which we improved a bit.
+- 2026-01-16: queue: harden disk recovery after invalid .qi
+  This probably fixes rare but reported disk queue startup errors, at
+  least a subset of them (these cases were hard to reproduce).
+  Hardens disk-queue recovery after an invalid .qi so read/write pointers
+  realign and on-disk size is corrected. This prevents stuck queues and
+  stabilizes the daqueue dirty shutdown test.
+  Bug Fixes
+  - On anomaly (rd==wr and offsets equal), seek the read-delete cursor to
+    the writer, subtract deleted bytes from sizeOnDisk, and align the
+    read-dequeue cursor; keep draining if seek fails.
+  - Log errors when pointer resets or seeks fail.
+  - Add strm.Sync() to keep stream state consistent after pointer updates.
+  - Refactor invalid .qi recovery and startup seek errors into helpers.
+  - When spool read files are missing on startup, align read to write and
+    continue recovery.
+- 2026-01-16: core: fsync+atomic rename for pid file; abort on failure
+  Empty pid files were reported by users, leading to supervision issues.
+  This hardens startup so that the pid file is either durably written or
+  rsyslog exits. This improves reliability for service managers and
+  container setups where pid files are still required.
+  Impact: Startup now aborts when the pid file cannot be durably written.
+  Special thanks to github user @HappyDrink-okk for a prototype PR and
+  bringing up the issue.
+  NOTE: CHANGE OF BEHAVIOUR
+        Other than before, failing to write the pid file will make rsyslog
+		abort on startup. This is highly unlikely, and on VMs/bare metal
+		pid files are usually no longer used. For containers the new
+		mode is much more considerable.
+  see also https://github.com/rsyslog/rsyslog/pull/5391
+- 2026-01-16: ossl net driver: added support for wolfssl
+  This disablles some of the ossl driver capabilities that are not conformant
+  with how wolfssl operates (e.g. anon ciphers) but is a very solid basis
+  for using wolfssl where there is e.g. a certification requirement.
+  Note that the ossl driver can either be build for wolfssl, libressl, or
+  openssl. This needs to be decided at build time.
+  Thanks to Hayden Roche for the contribution.
+- 2026-01-13: rainerscript: add append_json() function
+  Thanks to github user 20syldev for the patch.
+- 2026-01-12: imfile: ensure state files are deleted correctly on log rotation
+  When log rotation occurs, imfile sometimes fails to delete the old state
+  files.
+  Thanks to Sagar Singh for the patch.
+- 2026-01-12: rainerscript: add is_in_subnet() built-in
+  Improve usability by providing a simple way to check if an IP is inside
+  a CIDR subnet directly in RainerScript. This reduces awkward workarounds
+  and makes common filtering and routing tasks easier to express.
+- 2026-01-12: testbench: improved tests for mmjsontransform and mmjsonparse
+- 2026-01-07: runtime: fix race condition in worker thread cancellation
+  Fixed a race condition in wtiCancelThrd() where thrdID could be accessed
+  after the thread had already terminated and been joined by another caller,
+  potentially resulting in pthread_cancel/pthread_kill operating on an
+  invalid or reused thread ID.
+- 2026-01-07: omazureeventhubs: fix data races and suppressions
+  There were thread synchronization issues in omazureeventhubs, which now
+  have been solved. Also some new, verified, valgrind suppressions have
+  been added for Proton lib (outside of rsyslog project).
+- 2026-01-07: runtime: fix inconsistent synchronization of iCurNumWrkThrd
+  Fixed inconsistent access to iCurNumWrkThrd where the shutdown loop used
+  a plain read while all other accesses used atomic operations. This could
+  result in the loop reading a stale value and not properly detecting when
+  all workers have terminated.
+  Note: there were not reports from practice, patch trigerred by code review.
+  This is from a series of patches on potential data races in action runtime.
+- 2026-01-07: runtime: runtime: fix TOCTOU race in worker thread creation
+  Fixed a Time-Of-Check-Time-Of-Use race condition in wtpStartWrkr() where
+  the wtpState check occurred before acquiring mutWtp. This allowed the
+  state to change between the check and worker thread creation, potentially
+  resulting in workers being created during shutdown.
+  Note: there were not reports from practice, patch trigerred by code review.
+  This is from a series of patches on potential data races in action runtime.
+- 2026-01-07: runtime: fix race in wtpSetState()
+  Fixed a race condition where wtpSetState() used a plain store while readers
+  (wtpChkStopWrkr) used atomic loads. This violated the C11 memory model and
+  created undefined behavior, potentially causing shutdown delays and
+  potential message loss.
+  Note: there were not reports from practice, patch trigerred by code review.
+  This is from a series of patches on potential data races in action runtime.
+- 2026-01-07: imfile: fix file handle leaks
+  FIle handler leaks can occur if the deleted file still has a lingering symbolic
+  link, even if the file has actually been deleted.
+  Thanks to Nelson Yen for the patch.
+- 2026-01-06: runtime: fix race condition in worker thread startup
+  Fixed a critical race condition in `wtpStartWrkr` where the same worker thread
+  instance (`wti_t`) could be started twice if multiple threads called `wtpStartWrkr`
+  concurrently. This occurred because the check for `WRKTHRD_STOPPED` and the
+  subsequent transition to `WRKTHRD_INITIALIZING` were not atomic.
+  The fix introduces a new `wtiCASState` function that uses atomic Compare-And-Swap
+  to safely reserve a worker slot. This ensures that only one thread can successfully
+  transition a worker from `STOPPED` to `INITIALIZING`, preventing duplicate reuse.
+  This resolves crashes and memory corruption seen in threaded outputs (e.g., ommysql)
+  where thread-local data was incorrectly shared between two active threads.
+  Note that such conditions only occured under pressure. There were no bug
+  reports from practice, we detected this via CI.
+- 2026-01-05: mysql: stabilize async ommysql workers via proper thread init
+  ThreadSanitizer flagged potential races in the MySQL client library when
+  multiple workers run concurrently. While the rsyslog module architecture
+  already ensures per-worker isolation (each worker has its own connection
+  handle and data structures), the client library itself can trigger
+  TSAN reports or Valgrind aborts if thread initialization is not strictly
+  managed.
+  This patch improves stability by keeping mysql_thread_init/mysql_thread_end
+  paired per worker using a `threadInitialized` flag. This ensures the
+  client library stays correctly bound to rsyslog queue threads, avoiding
+  the Valgrind aborts seen in mysql-asyn-vg and potential TSAN warnings
+  without the need for heavy-handed mutex serialization or skipping tests.
+  Further changes:
+  - Use a per-worker reusable SQL buffer to reduce allocation overhead
+  - Overflow-safe SQL buffer growth (SIZE_MAX guard)
+  - tests/mysql-asyn.sh: Enabled for TSAN, as thread_init fixes the root cause
+- 2026-01-05: queue: re-implement queue size warnings
+  This restores the warnings for invalid queue.highWaterMark and
+  queue.lowWaterMark configurations which were reverted in a previous
+  commit due to regressions.
+  The logic has been improved to only emit warnings if the user
+  explicitly configured an invalid value (i.e., not the default -1).
+  Previously, default values (which are -1) were triggering the warnings
+  incorrectly.
+  See also https://github.com/rsyslog/rsyslog/issues/5615
+  See also https://github.com/rsyslog/rsyslog/issues/5586
+  See also https://github.com/rsyslog/rsyslog/issues/5676
+  closes https://github.com/rsyslog/rsyslog/issues/5677
+- 2026-01-04: lookup_table: fix issue with int32 vs. int64
+  There were some issues with int32 overflow, which could lead to improper
+  lookup table returns. This has now been fixed.
+  Thanks to Janmejay Singh for the patch.
+- 2026-01-03: runtime/nsd_ossl.c: fix potential authmode authorization bypass
+  In the `ossl` driver, `doRetry` unconditionally cleared the `rtryCall` state after
+  calling `osslHandshakeCheck`, even if the handshake was still incomplete (e.g.,
+  returning `WANT_READ` and re-setting the retry flag). This caused subsequent receive
+  operations to assume the handshake was finished, potentially bypassing the
+  authorization check (`osslChkPeerAuth`).
+  This change ensures `rtryCall` is reset *before* attempting the handshake, so that
+  if `osslHandshakeCheck` sets it again, the state is preserved. This logic aligns
+  with the intent of the retry mechanism and prevents the bypass.
+  closes https://github.com/rsyslog/rsyslog/issues/6350
+- 2026-01-02: tcpsrv: restore default stack size assignment
+  Worker threads need to be assigned the "rsyslog default stack size".
+  This is especially an issue with musl lib, which has a very small stack
+  size. As such, rsyslog can segfault without specifying our expected
+  Note that the segfault would most probably occur with imtcp when running
+  e.g. under Alpine Linux.
+  stack size.
+  closes https://github.com/rsyslog/rsyslog/issues/6357
+- 2026-01-02: omfwd: add DNS SRV discovery (targetSrv)
+  Simplify large-scale configs by auto-discovering receivers via DNS SRV
+  records. This reduces per-host configuration and helps enterprise and
+  container setups where target pools change over time.
+  Impact: new param `targetSrv`; config now errors on conflicts or empty
+  SRV answers; feature depends on resolver support.
+  closes https://github.com/rsyslog/rsyslog/issues/6314
+- 2026-01-01: net driver ossl: fix ctx double-free and config string leaks
+  This improves stability of the OpenSSL stream driver and prevents
+  occasional aborts seen in the field with rulesets and per-host TLS
+  configuration. It also reduces memory growth during reconfiguration.
+  Impact: Fixes a crash (double-free) and plugs several leaks; no config
+  or API changes.
+  closes: https://github.com/rsyslog/rsyslog/issues/6358
+- 2026-01-01: core, runtime, omfwd: plumb action name into modules and logs
+  Non-technical: actions need to obtain their name for better reporting.
+  This wires a safe way for OMs to learn their owning action and use its
+  human-readable name in diagnostics.
+  Impact: omfwd log messages now include the action name in some errors.
+  Also, a generic internal API has been added to enable actions to obtain
+  their assigned name. The omfwd change is primarily a template of how
+  this can be done (but also useful in itself).
+  With the help of AI Agents: ChatGPT Codex
+- 2025-12-31: imjournal: make PRIORITY parsing robust and quiet
+  Some systems emit journal entries where PRIORITY is not exactly
+  "PRIORITY=X". The previous parser treated multi-byte PRIORITY values
+  as errors and logged for every message, creating the impression of
+  trouble when internal rate limiting kicked in. This also lead users to
+  the false impression that journal messages were lost. The change reduces
+  noise and keeps rsyslog calm in noisy journald environments.
+  Impact: Internal error spam is eliminated; unparsable values fall back
+  to the configured default severity; numeric out-of-range is logged at
+  INFO, not ERROR.
+  Before/After: BEFORE required length==10 and errored on mismatch.
+  AFTER parses the integer from a safe buffer, validates 0–7, otherwise
+  uses the default severity without spamming logs.
+  closes: https://github.com/rsyslog/rsyslog/issues/5613
+- 2025-12-30: omelasticsearch fix: potential NULL dereference
+  Under some exotic cases, omelasticsearch could dereference a NULL
+  pointer during shutdown cleanup. This would lead to undefined behaviour
+  and most likely an abort. This is fixed in this patch.
+  With the Help of AI Agent: ChatGPT Codex
+  closes https://github.com/rsyslog/rsyslog/issues/4016
+- 2025-12-28: omfwd: fix RebindInterval suspension and improve UDP cleanup
+  This fix ensures that forwarding actions do not experience a 30-second
+  suspension when re-establishing connections as configured by
+  RebindInterval. This improves maintainability and reliability.
+  Impact: Eliminates unwanted action suspensions during rebinds.
+  closes: https://github.com/rsyslog/rsyslog/issues/5722
+- 2025-12-28: imjournal: removed unused pollfailed stats counter
+  This was probably a left-over from some copy&paste when stats counters
+  were initially added.
+- 2025-12-26: rainerscript: add split() function
+  Users need to parse delimited strings (CSV, tags, paths) into arrays
+  for iteration or JSON output without external processing.
+  Thanks to github user 20syldev for the patch.
+- 2025-12-24: rainerscript: ensure parse_json consumes entire input string
+  This fix ensures that parse_json() only succeeds if the entire input
+  string is a valid JSON value. This prevents false positives when a
+  non-JSON string happens to start with a valid JSON value, like a number.
+  Documentation is updated to reflect this stricter validation.
+  Impact: Corrects false-success in parse_json() for malformed input.
+  Fixes: https://github.com/rsyslog/rsyslog/issues/4970
+  With the helpo of AI-Agent: Antigravity
+- 2025-12-23: imjournal: fix potential segfault (SIGBUS)
+  This fixes a problem in imjournal that can result in SIGBUS or other
+  problems. Note that I could not reproduce the issue myself, but it looks
+  very plausible that this is indeed a useful fix.
+  closes: https://github.com/rsyslog/rsyslog/issues/6359
+- 2025-12-23: doc/AI: add RAG Knowledge Base extraction and build integration
+  This commit adds a context-aware RAG dataset generator and integrates
+  it into the build system to support advanced AI-driven documentation
+  workflows. It ensures a consistent knowledge base for RAG pipelines.
+- 2025-12-21: doc: modernize and expand queue concept documentation
+  This brings the queue concepts page in line with current RainerScript
+  syntax and features. It improves maintainability and makes the docs
+  more consumable for both humans and tooling.
+  Impact: docs-only; no runtime or config behavior change.
+- 2025-12-21: netstream ossl driver: fix double close
+  There was a double-close of the socket due to a code bug. This caused a race
+  that, depending on timing, could lead to undefined behaviour or segfault.
+  Thanks to Yuli Fiterman for the patch.
+- 2025-12-21: doc: update agent guidelines to require documentation for new parameters
+  This change updates the root AGENTS.md, plugins/AGENTS.md, and
+  MODULE_AUTHOR_CHECKLIST.md to explicitly require that new configuration
+  parameters be documented in the doc/ subtree. This ensures that
+  future AI agents (and humans) do not overlook documentation tasks
+  when implementing new features.
+  Impact: Improved documentation coverage and consistency for new
+  features.
+  AI-Agent: Antigravity
+- 2025-12-21: impstats: add log.file.overwrite parameter for atomic overwrites
+  This change adds the capability to overwrite the statistics log file
+  instead of appending to it. This is particularly useful for
+  observability tools like Prometheus scraping sidecars or node exporter,
+  which expect a consistent and complete set of metrics in a single file.
+  The implementation ensures atomicity by writing the statistics to a
+  temporary file and then renaming it to the final destination. This
+  prevents reader processes from seeing partial or inconsistent data
+  during the emission process.
+  This commit includes:
+  - The implementation in impstats.c.
+  - New test cases in the testbench.
+  - User-facing documentation for the new parameter.
+  Impact: Users can now enable atomic overwrites using
+  log.file.overwrite="on". Default behavior remains append.
+  AI-Agent: Antigravity
+- 2025-12-21: Fix doc build CI security, spelling, and RST build errors
+  Security & CI improvements:
+  - Remove pull_request_target trigger (security vulnerability)
+  - Simplify checkout to use default behavior (matches other workflows)
+  - Reduce fetch-depth from 8 to 2 for change detection
+  - Simplify conditional logic throughout workflow
+  - Enable fork PR support: allow fork PRs to build docs and produce artifacts
+  - Make Pages deployment conditional: only deploy for same-repo PRs
+  - Update PR comments to handle fork vs same-repo PRs appropriately
+  Documentation fixes:
+  - Fix 3 instances of "it's" → "its" in reliable_logging.rst
+  - Fix 22 RST build errors: replace :json: roles with inline code in
+    6 mmdarwin parameter files
+  The workflow now follows the same pattern as 19 other workflows in the
+  repository, improves security posture, enables fork contributors to build
+  documentation, and fixes all documentation build errors.
 - 2025-12-11: core: stop busy-loop when action disables itself
   In the field, an action that disables itself could leave workers in a
   tight retry/commit cycle, pegging a CPU core. This change makes the

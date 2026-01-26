@@ -7,7 +7,7 @@
  * of the "old" message code without any modifications. However, it
  * helps to have things at the right place one we go to the meat of it.
  *
- * Copyright 2007-2023 Rainer Gerhards and Adiscon GmbH.
+ * Copyright 2007-2026 Rainer Gerhards and Adiscon GmbH.
  *
  * This file is part of the rsyslog runtime library.
  *
@@ -241,13 +241,13 @@ void getRawMsgAfterPRI(smsg_t *const pM, uchar **pBuf, int *piLen);
 
 
 /* the locking and unlocking implementations: */
-static inline void MsgLock(smsg_t *pThis) {
+void MsgLock(smsg_t *pThis) {
 #if DEV_DEBUG == 1
     dbgprintf("MsgLock(0x%lx)\n", (unsigned long)pThis);
 #endif
     pthread_mutex_lock(&pThis->mut);
 }
-static inline void MsgUnlock(smsg_t *pThis) {
+void MsgUnlock(smsg_t *pThis) {
 #if DEV_DEBUG == 1
     dbgprintf("MsgUnlock(0x%lx)\n", (unsigned long)pThis);
 #endif
@@ -3229,7 +3229,7 @@ static rsRetVal jsonEncode(uchar **ppRes, unsigned short *pbMustBeFreed, int *pB
          * previous data.
          */
         if (*pbMustBeFreed) free(*ppRes);
-        *ppRes = (uchar *)es_str2cstr(dst, NULL);
+        CHKmalloc(*ppRes = (uchar *)es_str2cstr(dst, NULL));
         *pbMustBeFreed = 1;
         *pBufLen = -1;
         es_deleteStr(dst);
@@ -3269,6 +3269,18 @@ static rsRetVal ATTR_NONNULL() jsonField(const struct templateEntry *const pTpe,
             FINALIZE;
         }
         is_numeric = 0;
+    } else if (pTpe->data.field.options.dataType == TPE_DATATYPE_NUMBER) {
+        /* trim whitespace for numeric checks */
+        while (buflen > 0 && isspace((int)*pSrc)) {
+            ++pSrc;
+            --buflen;
+        }
+        while (buflen > 0 && isspace((int)pSrc[buflen - 1])) --buflen;
+
+        if (pTpe->data.field.options.bOmitIfZero && buflen == 1 && pSrc[0] == '0') {
+            *pBufLen = 0;
+            FINALIZE;
+        }
     }
     /* we hope we have only few escapes... */
     dst = es_newStr(buflen + pTpe->lenFieldName + 15);
@@ -3314,7 +3326,7 @@ static rsRetVal ATTR_NONNULL() jsonField(const struct templateEntry *const pTpe,
     if (*pbMustBeFreed) free(*ppRes);
     /* we know we do not have \0 chars - so the size does not change */
     *pBufLen = es_strlen(dst);
-    *ppRes = (uchar *)es_str2cstr(dst, NULL);
+    CHKmalloc(*ppRes = (uchar *)es_str2cstr(dst, NULL));
     *pbMustBeFreed = 1;
     es_deleteStr(dst);
 
@@ -3367,6 +3379,45 @@ finalize_it:
         *pPropLen = sizeof("**OUT OF MEMORY**") - 1;  \
         return (UCHAR_CONSTANT("**OUT OF MEMORY**")); \
     }
+
+/**
+ * \brief Helper function to generate a string property from a source buffer.
+ *
+ * This function allocates a new buffer, copies the content from the source,
+ * null-terminates it, and manages the memory of the previous result string.
+ *
+ * \param[in,out] ppRes        Pointer to the result string pointer. The old string is freed if *pbMustBeFreed is set.
+ *                             The new string is assigned to *ppRes.
+ * \param[in,out] pbMustBeFreed Pointer to the boolean flag indicating if *ppRes must be freed.
+ *                              Updated to 1 (true) upon successful allocation.
+ * \param[out]    pBufLen      Pointer to store the length of the new string.
+ * \param[in]     pSrc         Pointer to the source buffer to copy from.
+ * \param[in]     len          Length of the data to copy.
+ *
+ * \return rsRetVal RS_RET_OK on success, RS_RET_OUT_OF_MEMORY on allocation failure.
+ */
+static rsRetVal msgPropStrGen(
+    uchar **ppRes, unsigned short *pbMustBeFreed, rs_size_t *pBufLen, const uchar *pSrc, size_t len) {
+    uchar *pBuf = NULL;
+    DEFiRet;
+
+    CHKmalloc(pBuf = malloc(len + 1));
+
+    memcpy(pBuf, pSrc, len);
+    pBuf[len] = '\0';
+
+    if (*pbMustBeFreed == 1) free(*ppRes);
+    *ppRes = pBuf;
+    *pbMustBeFreed = 1;
+    *pBufLen = (rs_size_t)len;
+
+finalize_it:
+    if (iRet != RS_RET_OK) {
+        free(pBuf);
+    }
+    RETiRet;
+}
+
 uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                   struct templateEntry *__restrict__ const pTpe,
                   msgPropDescr_t *pProp,
@@ -3808,18 +3859,13 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
             /* we got our end pointer, now do the copy */
             /* TODO: code copied from below, this is a candidate for a separate function */
             iLen = pFldEnd - pFld + 1; /* the +1 is for an actual char, NOT \0! */
-            pBufStart = pBuf = malloc(iLen + 1);
-            if (pBuf == NULL) {
-                if (*pbMustBeFreed == 1) free(pRes);
+            if (msgPropStrGen(&pRes, pbMustBeFreed, &bufLen, pFld, iLen) != RS_RET_OK) {
+                if (*pbMustBeFreed == 1) {
+                    free(pRes);
+                    *pbMustBeFreed = 0;
+                }
                 RET_OUT_OF_MEMORY;
             }
-            /* now copy */
-            memcpy(pBuf, pFld, iLen);
-            bufLen = iLen;
-            pBuf[iLen] = '\0'; /* terminate it */
-            if (*pbMustBeFreed == 1) free(pRes);
-            pRes = pBufStart;
-            *pbMustBeFreed = 1;
         } else {
             /* field not found, return error */
             if (*pbMustBeFreed == 1) free(pRes);
@@ -3917,25 +3963,19 @@ uchar *MsgGetProp(smsg_t *__restrict__ const pMsg,
                     }
                     /* OK, we have a usable match - we now need to malloc pB */
                     int iLenBuf;
-                    uchar *pB;
 
                     iLenBuf =
                         pmatch[pTpe->data.field.iSubMatchToUse].rm_eo - pmatch[pTpe->data.field.iSubMatchToUse].rm_so;
-                    pB = malloc(iLenBuf + 1);
 
-                    if (pB == NULL) {
-                        if (*pbMustBeFreed == 1) free(pRes);
+                    if (msgPropStrGen(&pRes, pbMustBeFreed, &bufLen,
+                                      pRes + iOffs + pmatch[pTpe->data.field.iSubMatchToUse].rm_so,
+                                      iLenBuf) != RS_RET_OK) {
+                        if (*pbMustBeFreed == 1) {
+                            free(pRes);
+                            *pbMustBeFreed = 0;
+                        }
                         RET_OUT_OF_MEMORY;
                     }
-
-                    /* Lets copy the matched substring to the buffer */
-                    memcpy(pB, pRes + iOffs + pmatch[pTpe->data.field.iSubMatchToUse].rm_so, iLenBuf);
-                    bufLen = iLenBuf;
-                    pB[iLenBuf] = '\0'; /* terminate string, did not happen before */
-
-                    if (*pbMustBeFreed == 1) free(pRes);
-                    pRes = pB;
-                    *pbMustBeFreed = 1;
                 }
             } else {
                 /* we could not load regular expression support. This is quite unexpected at
@@ -4666,7 +4706,6 @@ finalize_it:
 }
 
 static rsRetVal jsonMerge(struct json_object *existing, struct json_object *json) {
-    /* TODO: check & handle duplicate names */
     DEFiRet;
 
     struct json_object_iterator it = json_object_iter_begin(json);
@@ -4698,7 +4737,7 @@ rsRetVal jsonFind(smsg_t *const pMsg, msgPropDescr_t *pProp, struct json_object 
 
     if (*jroot == NULL) {
         field = NULL;
-        goto finalize_it;
+        FINALIZE;
     }
 
     if (!strcmp((char *)pProp->name, "!")) {
@@ -4954,7 +4993,7 @@ rsRetVal msgSetJSONFromVar(smsg_t *const pMsg, uchar *varname, struct svar *v, i
     DEFiRet;
     switch (v->datatype) {
         case 'S': /* string */
-            cstr = es_str2cstr(v->d.estr, NULL);
+            CHKmalloc(cstr = es_str2cstr(v->d.estr, NULL));
             json = json_object_new_string(cstr);
             free(cstr);
             break;
