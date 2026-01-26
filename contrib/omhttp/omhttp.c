@@ -208,6 +208,7 @@ typedef struct instanceConf_s {
     sbool *serverSuspended;   /* Array: Is server N globally suspended? */
     time_t *serverNextRetry;  /* Array: When can we try server N again? */
     pthread_mutex_t mutGlobalState; /* Protects these arrays */
+
 } instanceData;
 
 struct modConfData_s {
@@ -611,6 +612,10 @@ static inline void incrementServerIndex(wrkrInstanceData_t *pWrkrData) {
 }
 
 
+/* checks if connection to ES can be established; also iterates over
+ * potential servers to support high availability (HA) feature. If it
+ * needs to switch server, will record new one in curl handle.
+ */
 static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 	instanceData *pData = pWrkrData->pData;
     CURLcode res;
@@ -622,14 +627,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     if (pData->checkPath == NULL) {
         DBGPRINTF("omhttp: checkConn no health check uri configured skipping it\n");
         FINALIZE;
-    }
-
-    /* --- PERFORMANCE OPTIMIZATION: FAST PATH --- */
-    /* If the current worker already has a selected server and that server 
-       is NOT globally suspended, we can skip the heavy mutex and the 
-       health check logic entirely. */
-    if (pWrkrData->serverIndex != -1 && !pData->serverSuspended[pWrkrData->serverIndex]) {
-        return RS_RET_OK;
     }
 
     for (i = 0; i < pData->numServers; ++i) {
@@ -685,7 +682,7 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
             if (r == 0) server->fullUrlHealth = (uchar *)es_str2cstr(urlBuf, NULL);
             
             if (server->fullUrlHealth == NULL){
-				LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to generate fullUrlHealth buffer.");
+				LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to generate healthUrl buffer.");
 				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 			}
         }
@@ -1484,7 +1481,6 @@ static rsRetVal serializeBatchKafkaRest(wrkrInstanceData_t *pWrkrData, char **ba
         if (msgObj == NULL) {
             LogError(0, NO_ERRCODE, "omhttp: serializeBatchKafkaRest failed to parse %s as json ignoring it",
                      pWrkrData->batch.data[i]);
-            fjson_object_put(valueObj); // cleanup
             continue;
         }
         fjson_object_object_add(valueObj, "value", msgObj);
@@ -2666,8 +2662,6 @@ BEGINnewActInst
     if (servers != NULL) {
         pData->numServers = servers->nmemb;
         pData->serverBaseUrls = malloc(servers->nmemb * sizeof(uchar *));
-        CHKmalloc(pData->lastHealthCheck = calloc(pData->numServers, sizeof(time_t)));
-
         if (pData->serverBaseUrls == NULL) {
             LogError(0, RS_RET_ERR,
                      "omhttp: unable to allocate buffer "
@@ -2710,28 +2704,16 @@ BEGINnewActInst
             free(serverParam);
             serverParam = NULL;
         }
-
     } else {
         LogMsg(0, RS_RET_OK, LOG_WARNING, "omhttp: No servers specified, using localhost");
         pData->numServers = 1;
         pData->serverBaseUrls = malloc(sizeof(uchar *));
-        CHKmalloc(pData->lastHealthCheck = calloc(1, sizeof(time_t)));
         if (pData->serverBaseUrls == NULL) {
             LogError(0, RS_RET_ERR,
                      "omhttp: unable to allocate buffer "
                      "for http server configuration.");
             ABORT_FINALIZE(RS_RET_ERR);
         }
-
-        pData->listObjStats = malloc(sizeof(targetStats_t));
-        if (pData->listObjStats == NULL) {
-            LogError(0, RS_RET_ERR,
-                     "omhttp: unable to allocate buffer "
-                     "for http server stats object.");
-            ABORT_FINALIZE(RS_RET_ERR);
-        }
-        CHKiRet(setStatsObject(pData, NULL, 0));
-
         CHKiRet(computeBaseUrl("localhost", pData->defaultPort, pData->useHttps, pData->serverBaseUrls));
     }
 
