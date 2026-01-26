@@ -712,7 +712,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 	instanceData *pData = pWrkrData->pData;
     CURLcode res;
     es_str_t *urlBuf = NULL;
-    char *healthUrl = NULL;
     time_t now = time(NULL);
     int i, serverIdx, r;
     DEFiRet;
@@ -720,6 +719,14 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     if (pData->checkPath == NULL) {
         DBGPRINTF("omhttp: checkConn no health check uri configured skipping it\n");
         FINALIZE;
+    }
+
+    /* --- PERFORMANCE OPTIMIZATION: FAST PATH --- */
+    /* If the current worker already has a selected server and that server 
+       is NOT globally suspended, we can skip the heavy mutex and the 
+       health check logic entirely. */
+    if (pWrkrData->serverIndex != -1 && !pData->serverSuspended[pWrkrData->serverIndex]) {
+        return RS_RET_OK;
     }
 
     for (i = 0; i < pData->numServers; ++i) {
@@ -772,16 +779,12 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
                 }
             }
             
-            if (r == 0) healthUrl = es_str2cstr(urlBuf, NULL);
-            es_deleteStr(urlBuf); // Clean up es_str immediately
-            urlBuf = NULL;
+            if (r == 0) server->fullUrlHealth = (uchar *)es_str2cstr(urlBuf, NULL);
             
-            if (healthUrl == NULL){
-				LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to generate healthUrl buffer.");
+            if (server->fullUrlHealth == NULL){
+				LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to generate fullUrlHealth buffer.");
 				ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 			}
-            server->fullUrlHealth = (uchar *)healthUrl;
-            free(healthUrl);
         }
 		
 		curl_easy_setopt(server->curlCheckConnHandle, CURLOPT_URL, (char *)server->fullUrlHealth);
@@ -822,7 +825,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 
 finalize_it:
 	if (urlBuf != NULL) es_deleteStr(urlBuf);
-    if (healthUrl != NULL) free(healthUrl);
     RETiRet;
 }
 
@@ -1579,6 +1581,7 @@ static rsRetVal serializeBatchKafkaRest(wrkrInstanceData_t *pWrkrData, char **ba
         if (msgObj == NULL) {
             LogError(0, NO_ERRCODE, "omhttp: serializeBatchKafkaRest failed to parse %s as json ignoring it",
                      pWrkrData->batch.data[i]);
+            fjson_object_put(valueObj); // cleanup
             continue;
         }
         fjson_object_object_add(valueObj, "value", msgObj);
