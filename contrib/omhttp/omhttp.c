@@ -458,16 +458,8 @@ BEGINfreeWrkrInstance
     free(pWrkrData->listServerDataWkr);
     pWrkrData->listServerDataWkr = NULL;
 
-    /*free(pWrkrData->restURL);
-    pWrkrData->restURL = NULL;*/
-
     free(pWrkrData->batch.data);
     pWrkrData->batch.data = NULL;
-
-    /*if (pWrkrData->batch.restPath != NULL) {
-        free(pWrkrData->batch.restPath);
-        pWrkrData->batch.restPath = NULL;
-    }*/
 
     if (pWrkrData->bzInitDone) deflateEnd(&pWrkrData->zstrm);
     freeCompressCtx(pWrkrData);
@@ -481,7 +473,7 @@ BEGINdbgPrintInstInfo
     dbgprintf("\ttemplate='%s'\n", pData->tplName);
     dbgprintf("\tnumServers=%d\n", pData->numServers);
     dbgprintf("\thealthCheckTimeout=%lu\n", pData->healthCheckTimeout);
-    dbgprintf("\thealthchecktimedelay=%lu\n", pData->healthCheckTimeDelay);
+    dbgprintf("\thealthchecktimedelay=%ld\n", pData->healthCheckTimeDelay);
     dbgprintf("\trestPathTimeout=%lu\n", pData->restPathTimeout);
     dbgprintf("\tserverBaseUrls=");
     for (i = 0; i < pData->numServers; ++i) dbgprintf("%c'%s'", i == 0 ? '[' : ' ', pData->serverBaseUrls[i]);
@@ -615,6 +607,11 @@ static inline void incrementServerIndex(wrkrInstanceData_t *pWrkrData) {
 /* checks if connection to ES can be established; also iterates over
  * potential servers to support high availability (HA) feature. If it
  * needs to switch server, will record new one in curl handle.
+ * 
+ * New update :
+ * -> Add mutex into checkConn
+ * Allow one worker to check the status dest-server to avoid each worker doing the check
+ * Other worker just check if the current serverIndex is available or not.
  */
 static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 	instanceData *pData = pWrkrData->pData;
@@ -694,7 +691,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 		pWrkrData->replyLen = 0;
 		
         res = curl_easy_perform(server->curlCheckConnHandle);
-
         if (res == CURLE_OK) {
             /* Success: Clear global suspension */
             pthread_mutex_lock(&pData->mutGlobalState);
@@ -724,6 +720,8 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     ABORT_FINALIZE(RS_RET_SUSPENDED);
 
 finalize_it:
+    if(pWrkrData->reply != NULL) free(pWrkrData->reply);
+	pWrkrData->reply = NULL;
 	if (urlBuf != NULL) es_deleteStr(urlBuf);
     RETiRet;
 }
@@ -1695,10 +1693,6 @@ static inline size_t computeDeltaExtraOnAppend(const wrkrInstanceData_t *pWrkrDa
 static void ATTR_NONNULL() initializeBatch(wrkrInstanceData_t *pWrkrData) {
     pWrkrData->batch.sizeBytes = 0;
     pWrkrData->batch.nmemb = 0;
-    /*if (pWrkrData->batch.restPath != NULL) {
-        free(pWrkrData->batch.restPath);
-        pWrkrData->batch.restPath = NULL;
-    }*/
 }
 
 /* Adds a message to this worker's batch
@@ -1973,6 +1967,14 @@ static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, s
     if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlPostSetup unknown option CURLOPT_HTTP_VERSION\n");
 }
 
+/*
+ * New :
+ * Each dest-server has its own curl handle and slist Header
+ * - one handle for postdata and one handle for checkURL if set up
+ * - slist curl header is malloc for each dest-server but its data is the same for all 
+
+*/
+
 static rsRetVal ATTR_NONNULL() curlSetup(wrkrInstanceData_t *const pWrkrData) {
     struct curl_slist *slist;
     int i = 0;
@@ -2016,7 +2018,7 @@ finalize_it:
                 curl_easy_cleanup(pWrkrData->listServerDataWkr[j]->curlPostHandle);
                 pWrkrData->listServerDataWkr[j]->curlPostHandle = NULL;
             }
-            if (pWrkrData->listServerDataWkr[j]->curlPostHandle != NULL){
+            if (pWrkrData->listServerDataWkr[j]->curlCheckConnHandle != NULL){
                 curl_easy_cleanup(pWrkrData->listServerDataWkr[j]->curlCheckConnHandle);
                 pWrkrData->listServerDataWkr[j]->curlCheckConnHandle = NULL;
             }
@@ -2029,6 +2031,14 @@ finalize_it:
     RETiRet;
 }
 
+
+/*
+ * New :
+ * This function clean each curl object (post and health) of dest-server
+ * Also char* data of struct server is free
+ * 
+ * Next : change name ?
+*/
 static void ATTR_NONNULL() curlCleanup(wrkrInstanceData_t *const pWrkrData) {
     int size = pWrkrData->pData->numServers;
     if (pWrkrData->listServerDataWkr != NULL){
@@ -2050,12 +2060,11 @@ static void ATTR_NONNULL() curlCleanup(wrkrInstanceData_t *const pWrkrData) {
             if(pWrkrData->listServerDataWkr[i]->restPATH != NULL) {
                 free(pWrkrData->listServerDataWkr[i]->restPATH);
             }
-
             if (pWrkrData->listServerDataWkr[i]->curlHeader != NULL) {
                 curl_slist_free_all(pWrkrData->listServerDataWkr[i]->curlHeader);
                 pWrkrData->listServerDataWkr[i]->curlHeader = NULL;
             }
-
+            free(pWrkrData->listServerDataWkr[i]);
             pWrkrData->listServerDataWkr[i] = NULL;
         }
     }
@@ -2714,6 +2723,16 @@ BEGINnewActInst
                      "for http server configuration.");
             ABORT_FINALIZE(RS_RET_ERR);
         }
+        /* Set up the stats object array (force global stats) */
+        pData->listObjStats = malloc(sizeof(targetStats_t));
+        if (pData->listObjStats == NULL) {
+            LogError(0, RS_RET_ERR,
+                     "omhttp: unable to allocate buffer "
+                     "for http server stats object.");
+            ABORT_FINALIZE(RS_RET_ERR);
+        }
+        CHKiRet(setStatsObject(pData, NULL, 0));
+
         CHKiRet(computeBaseUrl("localhost", pData->defaultPort, pData->useHttps, pData->serverBaseUrls));
     }
 
