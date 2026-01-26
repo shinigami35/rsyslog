@@ -458,16 +458,8 @@ BEGINfreeWrkrInstance
     free(pWrkrData->listServerDataWkr);
     pWrkrData->listServerDataWkr = NULL;
 
-    /*free(pWrkrData->restURL);
-    pWrkrData->restURL = NULL;*/
-
     free(pWrkrData->batch.data);
     pWrkrData->batch.data = NULL;
-
-    /*if (pWrkrData->batch.restPath != NULL) {
-        free(pWrkrData->batch.restPath);
-        pWrkrData->batch.restPath = NULL;
-    }*/
 
     if (pWrkrData->bzInitDone) deflateEnd(&pWrkrData->zstrm);
     freeCompressCtx(pWrkrData);
@@ -615,6 +607,11 @@ static inline void incrementServerIndex(wrkrInstanceData_t *pWrkrData) {
 /* checks if connection to ES can be established; also iterates over
  * potential servers to support high availability (HA) feature. If it
  * needs to switch server, will record new one in curl handle.
+ * 
+ * New update :
+ * -> Add mutex into checkConn
+ * Allow one worker to check the status dest-server to avoid each worker doing the check
+ * Other worker just check if the current serverIndex is available or not.
  */
 static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 	instanceData *pData = pWrkrData->pData;
@@ -694,7 +691,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 		pWrkrData->replyLen = 0;
 		
         res = curl_easy_perform(server->curlCheckConnHandle);
-
         if (res == CURLE_OK) {
             /* Success: Clear global suspension */
             pthread_mutex_lock(&pData->mutGlobalState);
@@ -1695,10 +1691,6 @@ static inline size_t computeDeltaExtraOnAppend(const wrkrInstanceData_t *pWrkrDa
 static void ATTR_NONNULL() initializeBatch(wrkrInstanceData_t *pWrkrData) {
     pWrkrData->batch.sizeBytes = 0;
     pWrkrData->batch.nmemb = 0;
-    /*if (pWrkrData->batch.restPath != NULL) {
-        free(pWrkrData->batch.restPath);
-        pWrkrData->batch.restPath = NULL;
-    }*/
 }
 
 /* Adds a message to this worker's batch
@@ -1973,6 +1965,14 @@ static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, s
     if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlPostSetup unknown option CURLOPT_HTTP_VERSION\n");
 }
 
+/*
+ * New :
+ * Each dest-server has its own curl handle and slist Header
+ * - one handle for postdata and one handle for checkURL if set up
+ * - slist curl header is malloc for each dest-server but its data is the same for all 
+
+*/
+
 static rsRetVal ATTR_NONNULL() curlSetup(wrkrInstanceData_t *const pWrkrData) {
     struct curl_slist *slist;
     int i = 0;
@@ -2029,6 +2029,14 @@ finalize_it:
     RETiRet;
 }
 
+
+/*
+ * New :
+ * This function clean each curl object (post and health) of dest-server
+ * Also char* data of struct server is free
+ * 
+ * Next : change name ?
+*/
 static void ATTR_NONNULL() curlCleanup(wrkrInstanceData_t *const pWrkrData) {
     int size = pWrkrData->pData->numServers;
     if (pWrkrData->listServerDataWkr != NULL){
