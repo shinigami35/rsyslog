@@ -1093,8 +1093,9 @@ static rsRetVal checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg) {
     }
 
     if (iRet != RS_RET_OK) {
-        LogMsg(0, iRet, LOG_ERR, "omhttp: checkResult error http status code: %ld reply: %s", statusCode,
-               pWrkrData->reply != NULL ? pWrkrData->reply : "NULL");
+        char* serverName = (char *)pData->serverBaseUrls[pWrkrData->serverIndex];
+        LogMsg(0, iRet, LOG_ERR, "omhttp: checkResult error http status server: %s code: %ld reply: %s", serverName,
+               statusCode, pWrkrData->reply != NULL ? pWrkrData->reply : "NULL");
 
         writeDataError(pWrkrData, pWrkrData->pData, reqmsg);
 
@@ -1946,7 +1947,7 @@ static void ATTR_NONNULL() curlCheckConnSetup(wrkrInstanceData_t *const pWrkrDat
 static void ATTR_NONNULL(1) curlPostSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData) {
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     curlSetupCommon(pWrkrData, serverData->curlPostHandle);
-    curl_easy_setopt(serverData->curlPostHandle, CURLOPT_POST, 1);
+    curl_easy_setopt(serverData->curlPostHandle, CURLOPT_POST, 1L);
     CURLcode cRet;
     /* Enable TCP keep-alive for this transfer */
     cRet = curl_easy_setopt(serverData->curlPostHandle, CURLOPT_TCP_KEEPALIVE, 1L);
