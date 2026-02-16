@@ -48,6 +48,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <limits.h>
 #if defined(__FreeBSD__)
     #include <unistd.h>
 #endif
@@ -133,6 +134,7 @@ static uchar template_StdSplkRaw[] = "\"%rawmsg:::drop-last-lf%\n\"";
 
 /* Default batch size constants */
 #define DEFAULT_MAX_BATCH_BYTES (10 * 1024 * 1024) /* 10 MB - default max message size for AWS API Gateway */
+#define DEFAULT_REPLY_MAX_BYTES (1024 * 1024) /* 1 MB - default max response size */
 #define SPLUNK_HEC_MAX_BATCH_BYTES (1024 * 1024) /* 1 MB - Splunk HEC recommended limit */
 typedef enum batchFormat_e { FMT_NEWLINE, FMT_JSONARRAY, FMT_KAFKAREST, FMT_LOKIREST } batchFormat_t;
 typedef enum vendor_e { LOKI, SPLUNK } vendor_t;
@@ -175,6 +177,7 @@ typedef struct instanceConf_s {
     sbool dynRestPath;
     size_t maxBatchBytes;
     size_t maxBatchSize;
+    size_t replyMaxBytes;
     sbool compress;
     int compressionLevel; /* Compression level for zlib, default=-1, fastest=1, best=9, none=0*/
     sbool useHttps;
@@ -235,7 +238,8 @@ typedef struct wrkrInstanceData {
     PTR_ASSERT_DEF
     instanceData *pData;
     int serverIndex;
-    int replyLen;
+    size_t replyLen;
+    size_t replyBufLen;
     char *reply;
     long httpStatusCode; /* http status code of response */
     // uchar *restURL; /* last used URL for error reporting */
@@ -281,6 +285,7 @@ static struct cnfparamdescr actpdescr[] = {
     {"batch.format", eCmdHdlrGetWord, 0},
     {"batch.maxbytes", eCmdHdlrSize, 0},
     {"batch.maxsize", eCmdHdlrSize, 0},
+    {"replymaxbytes", eCmdHdlrSize, 0},
     {"compress", eCmdHdlrBinary, 0},
     {"compress.level", eCmdHdlrInt, 0},
     {"usehttps", eCmdHdlrBinary, 0},
@@ -344,7 +349,9 @@ BEGINcreateWrkrInstance
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
     pWrkrData->serverIndex = 0;
     pWrkrData->httpStatusCode = 0;
-    // pWrkrData->restURL = NULL;
+    pWrkrData->reply = NULL;
+    pWrkrData->replyLen = 0;
+    pWrkrData->replyBufLen = 0;
     pWrkrData->bzInitDone = 0;
     if (pData->batchMode) {
         pWrkrData->batch.nmemb = 0;
@@ -461,6 +468,10 @@ BEGINfreeWrkrInstance
 
     if (pWrkrData->bzInitDone) deflateEnd(&pWrkrData->zstrm);
     freeCompressCtx(pWrkrData);
+    free(pWrkrData->reply);
+    pWrkrData->reply = NULL;
+    pWrkrData->replyBufLen = 0;
+    pWrkrData->replyLen = 0;
 
 ENDfreeWrkrInstance
 
@@ -499,6 +510,7 @@ BEGINdbgPrintInstInfo
     dbgprintf("\tbatch.format='%s'\n", pData->batchFormatName);
     dbgprintf("\tbatch.maxbytes=%zu\n", pData->maxBatchBytes);
     dbgprintf("\tbatch.maxsize=%zu\n", pData->maxBatchSize);
+    dbgprintf("\treplymaxbytes=%zu\n", pData->replyMaxBytes);
     dbgprintf("\tcompress=%d\n", pData->compress);
     dbgprintf("\tcompress.level=%d\n", pData->compressionLevel);
     dbgprintf("\tallowUnsignedCerts=%d\n", pData->allowUnsignedCerts);
@@ -526,20 +538,47 @@ ENDdbgPrintInstInfo
 
 /* http POST result string ... useful for debugging */
 static size_t curlResult(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    char *p = (char *)ptr;
-    wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t *)userdata;
+    const char *const p = (const char *)ptr;
+    wrkrInstanceData_t *const pWrkrData = (wrkrInstanceData_t *)userdata;
     char *buf;
+    const size_t size_add = size * nmemb; // Size is always 1
     size_t newlen;
+
     PTR_ASSERT_CHK(pWrkrData, WRKR_DATA_TYPE_ES);
-    newlen = pWrkrData->replyLen + size * nmemb;
-    if ((buf = realloc(pWrkrData->reply, newlen + 1)) == NULL) {
-        LogError(errno, RS_RET_ERR, "omhttp: realloc failed in curlResult");
-        return 0; /* abort due to failure */
+    if (size_add > SIZE_MAX - pWrkrData->replyLen) {
+        LogError(0, RS_RET_ERR, "omhttp: reply buffer size overflow in curlResult");
+        pWrkrData->replyLen = 0;
+        if (pWrkrData->reply != NULL && pWrkrData->replyBufLen > 0) {
+            pWrkrData->reply[0] = '\0';
+        }
+        return 0;
     }
-    memcpy(buf + pWrkrData->replyLen, p, size * nmemb);
+    newlen = pWrkrData->replyLen + size_add;
+    if (pWrkrData->pData->replyMaxBytes > 0 && newlen > pWrkrData->pData->replyMaxBytes) {
+        LogError(0, RS_RET_ERR, "omhttp: reply buffer exceeds replymaxbytes limit (%zu)",
+                 pWrkrData->pData->replyMaxBytes);
+        if (pWrkrData->reply != NULL && pWrkrData->replyBufLen > 0) {
+            pWrkrData->reply[pWrkrData->replyLen] = '\0';
+        }
+        return 0;
+    }
+    if (newlen + 1 > pWrkrData->replyBufLen) {
+        if ((buf = realloc(pWrkrData->reply, newlen + 1)) == NULL) {
+            LogError(errno, RS_RET_ERR, "omhttp: realloc failed in curlResult");
+            if (pWrkrData->reply != NULL && pWrkrData->replyBufLen > 0) {
+                pWrkrData->reply[pWrkrData->replyLen] = '\0';
+            }
+            return 0; /* abort due to failure */
+        }
+        pWrkrData->replyBufLen = newlen + 1;
+        pWrkrData->reply = buf;
+    }
+    memcpy(pWrkrData->reply + pWrkrData->replyLen, p, size_add);
     pWrkrData->replyLen = newlen;
-    pWrkrData->reply = buf;
-    return size * nmemb;
+    if (pWrkrData->replyBufLen > 0) {
+        pWrkrData->reply[pWrkrData->replyLen] = '\0';
+    }
+    return size_add;
 }
 
 /* Build basic URL part, which includes hostname and port as follows:
@@ -624,6 +663,8 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
         FINALIZE;
     }
 
+    pWrkrData->replyLen = 0;
+
     for (i = 0; i < pData->numServers; ++i) {
         /* Round-robin */
         serverIdx = (pWrkrData->serverIndex + i) % pData->numServers;
@@ -654,6 +695,7 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
         }
         /* Setup URL and Handle if needed */
         if (server->fullUrlHealth == NULL) {
+             pWrkrData->replyLen = 0;
             urlBuf = es_newStr(256);
             if (urlBuf == NULL) {
                 LogError(0, RS_RET_OUT_OF_MEMORY, "omhttp: unable to allocate urlBuf buffer.");
@@ -684,8 +726,6 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
 
         curl_easy_setopt(server->curlCheckConnHandle, CURLOPT_URL, (char *)server->fullUrlHealth);
 
-        if (pWrkrData->reply != NULL) free(pWrkrData->reply);
-        pWrkrData->reply = NULL;
         pWrkrData->replyLen = 0;
 
         res = curl_easy_perform(server->curlCheckConnHandle);
@@ -718,9 +758,11 @@ static rsRetVal ATTR_NONNULL() checkConn(wrkrInstanceData_t *const pWrkrData) {
     ABORT_FINALIZE(RS_RET_SUSPENDED);
 
 finalize_it:
-    if (pWrkrData->reply != NULL) free(pWrkrData->reply);
-    pWrkrData->reply = NULL;
     if (urlBuf != NULL) es_deleteStr(urlBuf);
+    pWrkrData->replyLen = 0;
+    if (pWrkrData->reply != NULL && pWrkrData->replyBufLen > 0) {
+        pWrkrData->reply[0] = '\0';
+    }
     RETiRet;
 }
 
@@ -832,7 +874,8 @@ static rsRetVal renderJsonErrorMessage(wrkrInstanceData_t *pWrkrData, uchar *req
     if (pWrkrData->reply == NULL) {
         fjson_object_object_add(res, "message", fjson_object_new_string_len(ERR_MSG_NULL, strlen(ERR_MSG_NULL)));
     } else {
-        fjson_object_object_add(res, "message", fjson_object_new_string_len(pWrkrData->reply, pWrkrData->replyLen));
+        const size_t cappedLen = pWrkrData->replyLen > INT_MAX ? INT_MAX : pWrkrData->replyLen;
+        fjson_object_object_add(res, "message", fjson_object_new_string_len(pWrkrData->reply, (int)cappedLen));
     }
 
     if ((errRoot = fjson_object_new_object()) == NULL) {
@@ -921,7 +964,8 @@ static rsRetVal msgAddResponseMetadata(smsg_t *const __restrict__ pMsg,
     */
     json_object_object_add(json, "code", json_object_new_int(pWrkrData->httpStatusCode));
     if (pWrkrData->reply) {
-        json_object_object_add(json, "body", json_object_new_string(pWrkrData->reply));
+        const size_t cappedLen = pWrkrData->replyLen > INT_MAX ? INT_MAX : pWrkrData->replyLen;
+        json_object_object_add(json, "body", json_object_new_string_len(pWrkrData->reply, (int)cappedLen));
     }
     json_object_object_add(json, "batch_index", json_object_new_int(batch_index));
     CHKiRet(msgAddJSON(pMsg, (uchar *)"!omhttp!response", json, 0, 0));
@@ -1031,11 +1075,15 @@ static rsRetVal checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg) {
         STATSCOUNTER_INC(serverStats->ctrHttpRequestsStatus3xx, serverStats->mutCtrHttpRequestsStatus3xx);
         iRet = RS_RET_DATAFAIL;  // permanent failure
     } else if (statusCode >= 400 && statusCode < 500) {
-        // 4xx - client error, permanent failure (non-retriable)
         STATSCOUNTER_INC(serverStats->ctrHttpStatusFail, serverStats->mutCtrHttpStatusFail);
-        STATSCOUNTER_ADD(serverStats->ctrMessagesFail, serverStats->mutCtrMessagesFail, numMessages);
+        STATSCOUNTER_ADD(serverStats->ctrMessagesRetry, serverStats->mutCtrMessagesRetry, numMessages);
         STATSCOUNTER_INC(serverStats->ctrHttpRequestsStatus4xx, serverStats->mutCtrHttpRequestsStatus4xx);
-        iRet = RS_RET_DATAFAIL;  // permanent failure
+        if (statusCode == 429){
+            /* Return SUSPENDED to trigger rsyslog's retry logic */
+            iRet = RS_RET_SUSPENDED;
+        } else {
+            iRet = RS_RET_DATAFAIL;  // permanent failure
+        }
     } else if (statusCode >= 500) {
         // 5xx - server error, retriable
         STATSCOUNTER_INC(serverStats->ctrHttpStatusFail, serverStats->mutCtrHttpStatusFail);
@@ -1163,6 +1211,8 @@ static rsRetVal compressHttpPayload(wrkrInstanceData_t *pWrkrData, uchar *messag
             ABORT_FINALIZE(RS_RET_ZLIB_ERR);
         }
         pWrkrData->bzInitDone = 1;
+    } else {
+        deflateReset(&pWrkrData->zstrm);
     }
 
     CHKiRet(resetCompressCtx(pWrkrData, len));
@@ -1259,63 +1309,77 @@ finalize_it:
  * header at runtime, and if the compression fails, we do not want to send it.
  * Additionally, the curlCheckConnHandle should not be configured with a gzip header.
  */
+/* Local macro to safely append headers and handle OOM
+ * This prevents the leak where slist = curl_slist_append(slist...) returns NULL
+ * and causes us to lose the reference to the previously allocated list.
+ */
+ #define SAFE_APPEND(header_str) \
+        do { \
+            temp = curl_slist_append(slist, header_str); \
+            if (temp == NULL) { \
+                curl_slist_free_all(slist); \
+                ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY); \
+            } \
+            slist = temp; \
+        } while(0);
+
 static rsRetVal ATTR_NONNULL() buildCurlHeaders(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip) {
     struct curl_slist *slist = NULL;
-
+    /* Optimization: Temp pointer to capture return without losing list on error */
+    struct curl_slist *temp = NULL; 
     DEFiRet;
 
+    /* 1. Set Content-Type Header */
     if (pWrkrData->pData->httpcontenttype != NULL) {
         // If content type specified use it, otherwise use a sane default
-        slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerContentTypeBuf);
+        SAFE_APPEND((char *)pWrkrData->pData->headerContentTypeBuf);
     } else {
         if (pWrkrData->pData->batchMode) {
-            // If in batch mode, use the approprate content type header for the format,
-            // defaulting to text/plain with newline
+            // If in batch mode, use the appropriate content type header for the format
             switch (pWrkrData->pData->batchFormat) {
                 case FMT_JSONARRAY:
-                    slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+                    SAFE_APPEND(HTTP_HEADER_CONTENT_JSON);
                     break;
                 case FMT_KAFKAREST:
-                    slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_KAFKA);
+                    SAFE_APPEND(HTTP_HEADER_CONTENT_KAFKA);
                     break;
                 case FMT_NEWLINE:
-                    slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_TEXT);
+                    SAFE_APPEND(HTTP_HEADER_CONTENT_TEXT);
                     break;
                 case FMT_LOKIREST:
-                    slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+                    SAFE_APPEND(HTTP_HEADER_CONTENT_JSON);
                     break;
                 default:
-                    slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_TEXT);
+                    SAFE_APPEND(HTTP_HEADER_CONTENT_TEXT);
             }
         } else {
             // Otherwise non batch, presume most users are sending JSON
-            slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+            SAFE_APPEND(HTTP_HEADER_CONTENT_JSON);
         }
     }
 
-    CHKmalloc(slist);
-
-    // Configured headers..
+    /* 2. Add Configured Header (Single Key-Value) */
     if (pWrkrData->pData->headerBuf != NULL) {
-        slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerBuf);
-        CHKmalloc(slist);
+        SAFE_APPEND((char *)pWrkrData->pData->headerBuf);
     }
 
+    /* 3. Add Configured Headers (Array) */
     for (int k = 0; k < pWrkrData->pData->nHttpHeaders; k++) {
-        slist = curl_slist_append(slist, (char *)pWrkrData->pData->httpHeaders[k]);
-        CHKmalloc(slist);
+        SAFE_APPEND((char *)pWrkrData->pData->httpHeaders[k]);
     }
 
+    /* 4. Add Expect Header */
     // When sending more than 1Kb, libcurl automatically sends an Except: 100-Continue header
-    // and will wait 1s for a response, could make this configurable but for now disable
-    slist = curl_slist_append(slist, HTTP_HEADER_EXPECT_EMPTY);
-    CHKmalloc(slist);
+    // and will wait 1s for a response. We disable this behavior.
+    SAFE_APPEND(HTTP_HEADER_EXPECT_EMPTY);
 
+    /* 5. Add Compression Header */
     if (contentEncodeGzip) {
-        slist = curl_slist_append(slist, HTTP_HEADER_ENCODING_GZIP);
-        CHKmalloc(slist);
+        SAFE_APPEND(HTTP_HEADER_ENCODING_GZIP);
     }
 
+    /* 6. Assign to Worker Instance */
+    // Free the old list if it exists before assigning the new one
     if (pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader != NULL) {
         curl_slist_free_all(pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader);
         pWrkrData->listServerDataWkr[pWrkrData->serverIndex]->curlHeader = NULL;
@@ -1325,11 +1389,13 @@ static rsRetVal ATTR_NONNULL() buildCurlHeaders(wrkrInstanceData_t *pWrkrData, s
 
 finalize_it:
     if (iRet != RS_RET_OK) {
-        curl_slist_free_all(slist);
-        LogError(0, iRet, "omhttp: error allocating curl header slist, using previous one");
+        /* If we failed halfway, free the list we were building. */
+        if (slist != NULL) curl_slist_free_all(slist);
+        LogError(0, iRet, "omhttp: error allocating curl header slist");
     }
     RETiRet;
 }
+#undef SAFE_APPEND
 
 
 static rsRetVal ATTR_NONNULL(1, 2) curlPost(
@@ -1340,25 +1406,28 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     int indexStats = pWrkrData->pData->statsBySenders ? pWrkrData->serverIndex : 0;
     serverData_t *serverData = pWrkrData->listServerDataWkr[pWrkrData->serverIndex];
     char *postData;
-    int postLen;
+    size_t postLen;
+    curl_off_t postLenCurl;
     sbool compressed;
     DEFiRet;
 
     PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
-
-    pWrkrData->reply = NULL;
-    pWrkrData->replyLen = 0;
-    pWrkrData->httpStatusCode = 0;
-
-    postData = (char *)message;
-    postLen = msglen;
-    compressed = 0;
 
     if (pWrkrData->pData->numServers > 1) {
         DBGPRINTF("omhttp: checkConn has to be done\n");
         /* needs to be called to support ES HA feature */
         CHKiRet(checkConn(pWrkrData));
     }
+
+    pWrkrData->replyLen = 0;
+    pWrkrData->httpStatusCode = 0;
+    if (pWrkrData->reply != NULL && pWrkrData->replyBufLen > 0) {
+        pWrkrData->reply[0] = '\0';
+    }
+
+    postData = (char *)message;
+    postLen = msglen;
+    compressed = 0;
 
     if (pWrkrData->pData->compress) {
         iRet = compressHttpPayload(pWrkrData, message, msglen);
@@ -1368,7 +1437,7 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
             postData = (char *)pWrkrData->compressCtx.buf;
             postLen = pWrkrData->compressCtx.curLen;
             compressed = 1;
-            DBGPRINTF("omhttp: curlPost compressed %d to %d bytes\n", msglen, postLen);
+            DBGPRINTF("omhttp: curlPost compressed %d to %zu bytes\n", msglen, postLen);
         }
     }
 
@@ -1392,7 +1461,12 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     /* Set Curl object here */
     curl = serverData->curlPostHandle;
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postLen);
+    if (postLen > (size_t)LLONG_MAX) {
+        LogError(0, RS_RET_ERR, "omhttp: POST payload too large for libcurl (%zu bytes)", postLen);
+        ABORT_FINALIZE(RS_RET_ERR);
+    }
+    postLenCurl = (curl_off_t)postLen;
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, postLenCurl);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
     curlCode = curl_easy_perform(curl);
@@ -1421,24 +1495,21 @@ static rsRetVal ATTR_NONNULL(1, 2) curlPost(
     // Grab the HTTP Response code
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &pWrkrData->httpStatusCode);
     if (pWrkrData->reply == NULL) {
-        DBGPRINTF("omhttp: curlPost pWrkrData reply==NULL, replyLen = '%d'\n", pWrkrData->replyLen);
+        DBGPRINTF("omhttp: curlPost pWrkrData reply==NULL, replyLen = '%llu'\n",
+                  (unsigned long long)pWrkrData->replyLen);
     } else {
-        DBGPRINTF("omhttp: curlPost pWrkrData replyLen = '%d'\n", pWrkrData->replyLen);
-        if (pWrkrData->replyLen > 0) {
+        DBGPRINTF("omhttp: curlPost pWrkrData replyLen = '%llu'\n", (unsigned long long)pWrkrData->replyLen);
+        if (pWrkrData->replyBufLen > 0) {
             pWrkrData->reply[pWrkrData->replyLen] = '\0';
-            /* Append 0 Byte if replyLen is above 0 - byte has been reserved in malloc */
+            /* Append 0 byte when buffer is allocated to keep reply safely NUL-terminated */
         }
-        // TODO: replyLen++? because 0 Byte is appended
         DBGPRINTF("omhttp: curlPost pWrkrData reply: '%s'\n", pWrkrData->reply);
     }
     CHKiRet(checkResult(pWrkrData, message));
 
 finalize_it:
     incrementServerIndex(pWrkrData);
-    if (pWrkrData->reply != NULL) {
-        free(pWrkrData->reply);
-        pWrkrData->reply = NULL; /* don't leave dangling pointer */
-    }
+    pWrkrData->replyLen = 0;
     RETiRet;
 }
 
@@ -2095,6 +2166,7 @@ static void ATTR_NONNULL() setInstParamDefaults(instanceData *const pData) {
     pData->useHttps = 1;
     pData->maxBatchBytes = DEFAULT_MAX_BATCH_BYTES;  // 10 MB - default max message size for AWS API Gateway
     pData->maxBatchSize = 100;  // 100 messages
+    pData->replyMaxBytes = DEFAULT_REPLY_MAX_BYTES;  // 1 MB default max response size (0 disables limit)
     pData->compress = 0;  // off
     pData->compressionLevel = -1;  // default compression
     pData->allowUnsignedCerts = 0;
@@ -2484,6 +2556,8 @@ BEGINnewActInst
             pData->maxBatchBytes = (size_t)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "batch.maxsize")) {
             pData->maxBatchSize = (size_t)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "replymaxbytes")) {
+            pData->replyMaxBytes = (size_t)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "compress")) {
             pData->compress = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "compress.level")) {
