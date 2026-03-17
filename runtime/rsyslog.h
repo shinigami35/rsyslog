@@ -32,7 +32,10 @@
      */
     #pragma GCC diagnostic ignored "-Wstrict-prototypes"
     #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
-    #if __GNUC__ >= 8
+    #if __GNUC__ >= 8 || defined(__clang__)
+        #if defined(__clang__)
+            #pragma GCC diagnostic ignored "-Wunknown-warning-option"
+        #endif
         /* GCC, starting at least with version 8, is now really overdoing with it's
          * warning messages. We turn those off that either cause an enormous amount
          * of false positives or flag perfectly legal code as problematic.
@@ -96,6 +99,7 @@
 /* src end */
 
 #include <pthread.h>
+#include <string.h>
 #include "typedefs.h"
 
 #if defined(__GNUC__)
@@ -114,6 +118,7 @@
     #define PRAGMA_IGNORE_Wmissing_noreturn _Pragma("GCC diagnostic ignored \"-Wmissing-noreturn\"")
     #define PRAGMA_IGNORE_Wexpansion_to_defined _Pragma("GCC diagnostic ignored \"-Wexpansion-to-defined\"")
     #define PRAGMA_IGNORE_Wunknown_warning_option _Pragma("GCC diagnostic ignored \"-Wunknown-warning-option\"")
+    #define PRAGMA_IGNORE_Wjump_misses_init _Pragma("GCC diagnostic ignored \"-Wjump-misses-init\"")
     #if !defined(__clang__)
         #define PRAGMA_IGNORE_Wunknown_attribute _Pragma("GCC diagnostic ignored \"-Wunknown-attribute\"")
     #else
@@ -145,6 +150,7 @@
     #define PRAGMA_IGNORE_Wexpansion_to_defined
     #define PRAGMA_IGNORE_Wunknown_attribute
     #define PRAGMA_IGNORE_Wunknown_warning_option
+    #define PRAGMA_IGNORE_Wjump_misses_init
     #define PRAGMA_DIAGNOSTIC_PUSH
     #define PRAGMA_DIAGNOSTIC_POP
 #endif
@@ -784,6 +790,36 @@ enum rsRetVal_ {
 #define FINALIZE goto finalize_it;
 #define DEFiRet rsRetVal iRet = RS_RET_OK
 #define RETiRet return iRet
+
+#define RS_CONCAT_(a, b) a##b
+#define RS_CONCAT(a, b) RS_CONCAT_(a, b)
+
+/**
+ * @brief Compile-time assertion with a pre-C11 fallback.
+ *
+ * Uses C11 `_Static_assert` when available and otherwise falls back
+ * to a typedef-size check.
+ */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+    #define RS_STATIC_ASSERT(condition, message) _Static_assert((condition), message)
+#else
+    #define RS_STATIC_ASSERT(condition, message) \
+        typedef char RS_CONCAT(rs_static_assertion_line_, __LINE__)[(condition) ? 1 : -1] ATTR_UNUSED
+#endif
+
+/**
+ * @brief Copy a string literal into a fixed-size destination buffer.
+ *
+ * The macro enforces at compile time that `dst` is large enough for
+ * `lit` (including the trailing NUL) and then performs a `memcpy`.
+ *
+ * @note Intended for true fixed-size arrays, not pointer destinations.
+ */
+#define RS_COPY_LITERAL(dst, lit)                                                     \
+    do {                                                                              \
+        RS_STATIC_ASSERT(sizeof(dst) >= sizeof(lit), "destination buffer too small"); \
+        memcpy((dst), (lit), sizeof(lit));                                            \
+    } while (0)
 
 #define ABORT_FINALIZE(errCode) \
     do {                        \

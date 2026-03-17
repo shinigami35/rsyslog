@@ -193,8 +193,9 @@ typedef struct instanceConf_s {
     unsigned int *httpRetryCodes;
     int nIgnorableCodes;
     unsigned int *ignorableCodes;
-    unsigned int ratelimitInterval;
-    unsigned int ratelimitBurst;
+    int ratelimitInterval;
+    int ratelimitBurst;
+    uchar *pszRatelimitName;
     /* for retries */
     ratelimit_t *ratelimiter;
     uchar *retryRulesetName;
@@ -242,12 +243,10 @@ typedef struct wrkrInstanceData {
     size_t replyBufLen;
     char *reply;
     long httpStatusCode; /* http status code of response */
-    // uchar *restURL; /* last used URL for error reporting */
     sbool bzInitDone;
     z_stream zstrm; /* zip stream to use for gzip http compression */
     struct {
         uchar **data; /* array of strings, this will be batched up lazily */
-        // uchar *restPath; /* Helper for restpath in batch mode */
         size_t sizeBytes; /* total length of this batch in bytes */
         size_t nmemb; /* number of messages in batch (for statistics counting) */
 
@@ -257,7 +256,6 @@ typedef struct wrkrInstanceData {
         size_t curLen;
         size_t len;
     } compressCtx;
-    // added
     serverData_t **listServerDataWkr;
 
 } wrkrInstanceData_t;
@@ -303,6 +301,7 @@ static struct cnfparamdescr actpdescr[] = {
     {"retry.ruleset", eCmdHdlrString, 0},
     {"ratelimit.interval", eCmdHdlrInt, 0},
     {"ratelimit.burst", eCmdHdlrInt, 0},
+    {"ratelimit.name", eCmdHdlrString, 0},
     {"name", eCmdHdlrGetWord, 0},
     {"httpignorablecodes", eCmdHdlrArray, 0},
     {"profile", eCmdHdlrGetWord, 0},
@@ -392,7 +391,7 @@ BEGINcreateWrkrInstance
 
 finalize_it:
     if (iRet != RS_RET_OK) {
-        if (i > 0) {
+        if (pWrkrData->listServerDataWkr != NULL) {
             for (int j = 0; j < i; j++) free(pWrkrData->listServerDataWkr[j]);
             free(pWrkrData->listServerDataWkr);
             pWrkrData->listServerDataWkr = NULL;
@@ -438,6 +437,7 @@ BEGINfreeInstance
     free(pData->retryRulesetName);
     free(pData->ignorableCodes);
     if (pData->ratelimiter != NULL) ratelimitDestruct(pData->ratelimiter);
+    free(pData->pszRatelimitName);
     if (pData->bFreeBatchFormatName) free(pData->batchFormatName);
     if (pData->listObjStats != NULL) {
         const int numStats = pData->statsBySenders ? pData->numServers : 1;
@@ -525,8 +525,8 @@ BEGINdbgPrintInstInfo
     dbgprintf("\tretry='%d'\n", pData->retryFailures);
     dbgprintf("\tretry.addmetadata='%d'\n", pData->retryAddMetadata);
     dbgprintf("\tretry.ruleset='%s'\n", pData->retryRulesetName);
-    dbgprintf("\tratelimit.interval='%u'\n", pData->ratelimitInterval);
-    dbgprintf("\tratelimit.burst='%u'\n", pData->ratelimitBurst);
+    dbgprintf("\tratelimit.interval='%d'\n", pData->ratelimitInterval);
+    dbgprintf("\tratelimit.burst='%d'\n", pData->ratelimitBurst);
     for (i = 0; i < pData->nIgnorableCodes; ++i) dbgprintf("%c'%d'", i == 0 ? '[' : ' ', pData->ignorableCodes[i]);
     dbgprintf("]\n");
     dbgprintf("\tratelimit.interval='%d'\n", pData->ratelimitInterval);
@@ -2181,9 +2181,10 @@ static void ATTR_NONNULL() setInstParamDefaults(instanceData *const pData) {
     pData->retryAddMetadata = 0;
     pData->nhttpRetryCodes = 0;
     pData->httpRetryCodes = NULL;
-    pData->ratelimitBurst = 20000;
-    pData->ratelimitInterval = 600;
+    pData->ratelimitBurst = -1;
+    pData->ratelimitInterval = -1;
     pData->ratelimiter = NULL;
+    pData->pszRatelimitName = NULL;
     pData->retryRulesetName = NULL;
     pData->retryRuleset = NULL;
     pData->nIgnorableCodes = 0;
@@ -2633,9 +2634,11 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "retry.addmetadata")) {
             pData->retryAddMetadata = pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "ratelimit.burst")) {
-            pData->ratelimitBurst = (unsigned int)pvals[i].val.d.n;
+            pData->ratelimitBurst = (int)pvals[i].val.d.n;
         } else if (!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
-            pData->ratelimitInterval = (unsigned int)pvals[i].val.d.n;
+            pData->ratelimitInterval = (int)pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "ratelimit.name")) {
+            pData->pszRatelimitName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "name")) {
             pData->statsName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "httpignorablecodes")) {
@@ -2665,6 +2668,19 @@ BEGINnewActInst
                      "non-handled param '%s'",
                      actpblk.descr[i].name);
         }
+    }
+
+    if (pData->pszRatelimitName != NULL) {
+        if (pData->ratelimitInterval != -1 || pData->ratelimitBurst != -1) {
+            LogError(0, RS_RET_INVALID_PARAMS,
+                     "omhttp: ratelimit.name is mutually exclusive with "
+                     "ratelimit.interval and ratelimit.burst - using ratelimit.name");
+        }
+        pData->ratelimitInterval = 0;
+        pData->ratelimitBurst = 0;
+    } else {
+        if (pData->ratelimitInterval == -1) pData->ratelimitInterval = 600;
+        if (pData->ratelimitBurst == -1) pData->ratelimitBurst = 20000;
     }
 
     if (pData->pwd != NULL && pData->uid == NULL) {
@@ -2816,8 +2832,14 @@ BEGINnewActInst
     }
 
     if (pData->retryFailures) {
-        CHKiRet(ratelimitNew(&pData->ratelimiter, "omhttp", NULL));
-        ratelimitSetLinuxLike(pData->ratelimiter, pData->ratelimitInterval, pData->ratelimitBurst);
+        if (pData->pszRatelimitName != NULL) {
+            CHKiRet(ratelimitNewFromConfig(&pData->ratelimiter, loadModConf->pConf, (char *)pData->pszRatelimitName,
+                                           "omhttp", NULL));
+        } else {
+            CHKiRet(ratelimitNew(&pData->ratelimiter, "omhttp", NULL));
+            ratelimitSetLinuxLike(pData->ratelimiter, (unsigned)pData->ratelimitInterval,
+                                  (unsigned)pData->ratelimitBurst);
+        }
         ratelimitSetNoTimeCache(pData->ratelimiter);
     }
 

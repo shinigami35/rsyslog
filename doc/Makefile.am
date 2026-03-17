@@ -11,14 +11,14 @@ BUILDDIR      = build
 
 # However, to be safe and clean in Automake:
 html-local:
-	@$(SPHINXBUILD) -M html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@$(SPHINXBUILD) -b html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 	@echo "Applying Mermaid offline fix..."
-	@python3 ./tools/fix-mermaid-offline.py "$(BUILDDIR)/html"
+	@python3 ./tools/fix-mermaid-offline.py "$(BUILDDIR)"
 
 html-with-sitemap:
-	@$(SPHINXBUILD) -M html "$(SOURCEDIR)" "$(BUILDDIR)" -t with_sitemap $(SPHINXOPTS) $(O)
+	@$(SPHINXBUILD) -b html "$(SOURCEDIR)" "$(BUILDDIR)" -t with_sitemap $(SPHINXOPTS) $(O)
 	@echo "Applying Mermaid offline fix..."
-	@python3 ./tools/fix-mermaid-offline.py "$(BUILDDIR)/html"
+	@python3 ./tools/fix-mermaid-offline.py "$(BUILDDIR)"
 
 singlehtml:
 	@$(SPHINXBUILD) -M singlehtml "$(SOURCEDIR)" "$(BUILDDIR)" -t minimal_build $(SPHINXOPTS) -D rst_epilog='' $(O)
@@ -297,6 +297,8 @@ EXTRA_DIST = \
     source/containers/user_images.rst \
     source/dataflow.png \
     source/deployments/index.rst \
+    source/deployments/rosi_for_decision_makers.rst \
+    source/deployments/rosi_for_platform_teams.rst \
     source/deployments/rosi_collector/architecture.rst \
     source/deployments/rosi_collector/client_setup.rst \
     source/deployments/rosi_collector/grafana_dashboards.rst \
@@ -339,6 +341,7 @@ EXTRA_DIST = \
     source/faq/etl_tool.rst \
     source/faq/faq_overall.rst \
     source/faq/imtcp-tls-gibberish.rst \
+    source/faq/impstats-push-mode.rst \
     source/faq/imudp-packet-loss.rst \
     source/faq/index.rst \
     source/faq/vespa-ai-integration.rst \
@@ -356,6 +359,7 @@ EXTRA_DIST = \
     source/getting_started/index.rst \
     source/getting_started/installation.rst \
     source/getting_started/next_steps.rst \
+    source/getting_started/rosi_for_beginners.rst \
     source/getting_started/understanding_default_config.rst \
     source/gssapi.png \
     source/historical/high_performance.rst \
@@ -514,6 +518,7 @@ EXTRA_DIST = \
     source/reference/parameters/imgssapi-inputgssserverpermitplaintcp.rst \
     source/reference/parameters/imgssapi-inputgssserverrun.rst \
     source/reference/parameters/imgssapi-inputgssserverservicename.rst \
+    source/reference/parameters/imhttp-ratelimit-name.rst \
     source/reference/parameters/imjournal-defaultfacility.rst \
     source/reference/parameters/imjournal-defaultseverity.rst \
     source/reference/parameters/imjournal-defaulttag.rst \
@@ -525,6 +530,7 @@ EXTRA_DIST = \
     source/reference/parameters/imjournal-persiststateinterval.rst \
     source/reference/parameters/imjournal-ratelimit-burst.rst \
     source/reference/parameters/imjournal-ratelimit-interval.rst \
+    source/reference/parameters/imjournal-ratelimit-name.rst \
     source/reference/parameters/imjournal-remote.rst \
     source/reference/parameters/imjournal-statefile.rst \
     source/reference/parameters/imjournal-usepid.rst \
@@ -545,6 +551,7 @@ EXTRA_DIST = \
     source/reference/parameters/imklog-permitnonkernelfacility.rst \
     source/reference/parameters/imklog-ratelimitburst.rst \
     source/reference/parameters/imklog-ratelimitinterval.rst \
+    source/reference/parameters/imklog-ratelimit-name.rst \
     source/reference/parameters/immark-interval.rst \
     source/reference/parameters/immark-markmessagetext.rst \
     source/reference/parameters/immark-ruleset.rst \
@@ -619,6 +626,7 @@ EXTRA_DIST = \
     source/reference/parameters/imrelp-name.rst \
     source/reference/parameters/imrelp-oversizemode.rst \
     source/reference/parameters/imrelp-port.rst \
+    source/reference/parameters/imrelp-ratelimit-name.rst \
     source/reference/parameters/imrelp-ruleset-input.rst \
     source/reference/parameters/imrelp-ruleset.rst \
     source/reference/parameters/imrelp-tls-authmode.rst \
@@ -702,6 +710,7 @@ EXTRA_DIST = \
     source/reference/parameters/imuxsock-parsetrusted.rst \
     source/reference/parameters/imuxsock-ratelimit-burst.rst \
     source/reference/parameters/imuxsock-ratelimit-interval.rst \
+    source/reference/parameters/imuxsock-ratelimit-name.rst \
     source/reference/parameters/imuxsock-ratelimit-severity.rst \
     source/reference/parameters/imuxsock-ruleset.rst \
     source/reference/parameters/imuxsock-socket.rst \
@@ -714,6 +723,7 @@ EXTRA_DIST = \
     source/reference/parameters/imuxsock-syssock-parsetrusted.rst \
     source/reference/parameters/imuxsock-syssock-ratelimit-burst.rst \
     source/reference/parameters/imuxsock-syssock-ratelimit-interval.rst \
+    source/reference/parameters/imuxsock-syssock-ratelimit-name.rst \
     source/reference/parameters/imuxsock-syssock-ratelimit-severity.rst \
     source/reference/parameters/imuxsock-syssock-unlink.rst \
     source/reference/parameters/imuxsock-syssock-use.rst \
@@ -871,6 +881,7 @@ EXTRA_DIST = \
     source/reference/parameters/omelasticsearch-pwd.rst \
     source/reference/parameters/omelasticsearch-ratelimit-burst.rst \
     source/reference/parameters/omelasticsearch-ratelimit-interval.rst \
+    source/reference/parameters/omelasticsearch-ratelimit-name.rst \
     source/reference/parameters/omelasticsearch-rebindinterval.rst \
     source/reference/parameters/omelasticsearch-retryfailures.rst \
     source/reference/parameters/omelasticsearch-retryruleset.rst \
@@ -888,6 +899,7 @@ EXTRA_DIST = \
     source/reference/parameters/omelasticsearch-uid.rst \
     source/reference/parameters/omelasticsearch-usehttps.rst \
     source/reference/parameters/omelasticsearch-writeoperation.rst \
+    source/reference/parameters/omfwd-ratelimit-name.rst \
     source/reference/parameters/omfile-addlf.rst \
     source/reference/parameters/omfile-asyncwriting.rst \
     source/reference/parameters/omfile-closetimeout.rst \
@@ -952,6 +964,7 @@ EXTRA_DIST = \
     source/reference/parameters/omhttp-pwd.rst \
     source/reference/parameters/omhttp-ratelimit-burst.rst \
     source/reference/parameters/omhttp-ratelimit-interval.rst \
+    source/reference/parameters/omhttp-ratelimit-name.rst \
     source/reference/parameters/omhttp-reloadonhup.rst \
     source/reference/parameters/omhttp-restpath.rst \
     source/reference/parameters/omhttp-restpathtimeout.rst \
@@ -1082,6 +1095,7 @@ EXTRA_DIST = \
     source/reference/parameters/omudpspoof-sourcetemplate.rst \
     source/reference/parameters/omudpspoof-target.rst \
     source/reference/parameters/omudpspoof-template.rst \
+    source/reference/parameters/omusrmsg-ratelimit-name.rst \
     source/reference/parameters/omuxsock-abstract.rst \
     source/reference/parameters/omuxsock-networknamespace.rst \
     source/reference/parameters/omuxsock-socketname.rst \
@@ -1169,9 +1183,11 @@ EXTRA_DIST = \
     source/tutorials/gelf_forwarding.rst \
     source/tutorials/hash_sampling.rst \
     source/tutorials/high_database_rate.rst \
+    source/tutorials/impstats_push_victoriametrics.rst \
     source/tutorials/index.rst \
     source/tutorials/log_rotation_fix_size.rst \
     source/tutorials/log_sampling.rst \
+    source/tutorials/post_quantum_tls.rst \
     source/tutorials/random_sampling.rst \
     source/tutorials/recording_pri.rst \
     source/tutorials/reliable_forwarding.rst \
@@ -1216,5 +1232,8 @@ EXTRA_DIST = \
     tools/buildenv/tools/help \
     tools/buildenv/tools/version-info \
     tools/fix-mermaid-offline.py \
+    tools/inside_docker_doc_html.sh \
+    tools/pages-root-index.html \
+    tools/pages-robots.txt \
     tools/release_build.sh \
     utils/release_build.sh

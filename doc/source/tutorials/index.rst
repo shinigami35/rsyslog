@@ -8,6 +8,7 @@ These tutorials cover specific rsyslog features and use cases.
 
    tls_cert_summary
    tls
+   post_quantum_tls
    database
    high_database_rate
    reliable_forwarding
@@ -15,6 +16,7 @@ These tutorials cover specific rsyslog features and use cases.
    failover_syslog_server
    log_rotation_fix_size
    gelf_forwarding
+   impstats_push_victoriametrics
    log_sampling
    random_sampling
    hash_sampling

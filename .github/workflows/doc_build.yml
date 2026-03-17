@@ -36,6 +36,9 @@ jobs:
         with:
           files: |
             doc/**/*.rst
+            doc/source/conf.py
+            doc/tools/check-html-links.py
+            doc/tools/fix-mermaid-offline.py
 
       # we build from tarball to ensure no missing files!
       - name: setup make dist build env
@@ -73,7 +76,7 @@ jobs:
           autoreconf -fvi
           ./configure --enable-silent-rules --disable-testbench \
              --disable-imdiag --disable-imdocker --disable-imfile \
-             --disable-default-tests --disable-impstats --disable-imptcp \
+             --disable-default-tests --disable-impstats --disable-impstats-push --disable-imptcp \
              --disable-mmanon --disable-mmaudit --disable-mmfields \
              --disable-mmjsonparse --disable-mmpstrucdata \
              --disable-mmsequence --disable-mmutf8fix --disable-mail \
@@ -125,7 +128,7 @@ jobs:
           cd doc-builder
           ./configure --enable-silent-rules --disable-testbench \
              --disable-imdiag --disable-imdocker --disable-imfile \
-             --disable-default-tests --disable-impstats --disable-imptcp \
+             --disable-default-tests --disable-impstats --disable-impstats-push --disable-imptcp \
              --disable-mmanon --disable-mmaudit --disable-mmfields \
              --disable-mmjsonparse --disable-mmpstrucdata \
              --disable-mmsequence --disable-mmutf8fix --disable-mail \
@@ -142,6 +145,16 @@ jobs:
              --disable-omrabbitmq --disable-journal-tests --disable-mmdarwin \
              --disable-helgrind --disable-uuid --disable-fmhttp
           make -C doc html SPHINXOPTS="-j8 -W -q --keep-going"
+
+      - name: Validate generated HTML links
+        if: >-
+          ${{ github.event_name != 'pull_request' ||
+          steps.doc_changes.outputs.any_changed == 'true' }}
+        run: |
+          python3 doc/tools/check-html-links.py \
+            doc-builder/doc/build \
+            --check-root-absolute \
+            --check-anchors
 
       - name: Build RAG Knowledge Base
         if: >-
@@ -163,7 +176,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docs-html
-          path: doc-builder/doc/build/html
+          path: doc-builder/doc/build
 
       - name: Upload RAG artifact
         if: >-
@@ -321,31 +334,3 @@ jobs:
                 body: commentBody,
               });
             }
-
-  cleanup_pr_preview:
-    name: Cleanup PR preview (on close)
-    runs-on: ubuntu-latest
-    if: >-
-      ${{ github.event_name=='pull_request'&&github.event.action=='closed'}}
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout gh-pages
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          fetch-depth: 0
-
-      - name: Remove pr folder and push
-        run: |
-          set -e
-          dir="pr-${{ github.event.pull_request.number }}"
-          if [ -d "$dir" ]; then
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
-            git rm -r "$dir"
-            git commit -m "chore(docs): remove PR preview $dir"
-            git push
-          else
-            echo "No preview folder $dir to remove"
-          fi

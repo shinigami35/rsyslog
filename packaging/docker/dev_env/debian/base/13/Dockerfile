@@ -19,6 +19,7 @@ RUN 	apt-get update && \
 	flex \
 	gdb \
 	git \
+	gnutls-bin \
 	libaprutil1-dev \
 	libcivetweb-dev \
 	libcurl4-gnutls-dev \
@@ -35,9 +36,12 @@ RUN 	apt-get update && \
 	default-libmysqlclient-dev \
 	libnet1-dev \
 	libpcap-dev \
+	libprotobuf-c-dev \
 	libpq-dev \
 	libsasl2-dev \
+	libsnappy-dev \
 	libsnmp-dev \
+	libsodium-dev \
 	libssl-dev \
 	libsystemd-dev \
 	libtokyocabinet-dev \
@@ -52,6 +56,7 @@ RUN 	apt-get update && \
 	python3-pysnmp4 \
 	python3-pysnmp4-apps \
 	python3-pysnmp4-mibs \
+	protobuf-c-compiler \
 	tcl-dev \
 	uuid-dev \
 	valgrind \
@@ -77,8 +82,7 @@ RUN 	apt-get update && \
 RUN	apt-get update -y && \
 	apt-get install -y \
 	libestr-dev \
-	libfastjson-dev \
-	libsodium-dev && \
+	libfastjson-dev  && \
 	apt-get clean && \
 	rm -rf /var/lib/apt/lists/*
 
@@ -190,7 +194,7 @@ RUN	cd helper-projects && \
 	rm -r librelp && \
 	cd ..
 
-RUN	pip install --no-cache-dir pyasn1 pysnmp --break-system-packages --upgrade
+RUN	pip install --no-cache-dir pyasn1 pysnmp --break-system-packages --upgrade --ignore-installed
 
 # next ENV is specifically for running scan-build - so we do not need to
 # change scripts if at a later time we can move on to a newer version
@@ -241,6 +245,8 @@ ENV	RSYSLOG_CONFIGURE_OPTIONS \
 	--enable-mmutf8fix \
 	--enable-mysql \
 	--disable-omamqp1 \
+	--enable-omazuredce \
+	--enable-omazuredce-tests \
 	--disable-omczmq \
 	--enable-omhiredis \
 	--enable-omhttp \

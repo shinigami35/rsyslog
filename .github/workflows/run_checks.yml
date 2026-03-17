@@ -126,7 +126,7 @@ jobs:
       matrix:
         config: [centos_7, centos_8, debian_sid, debian_13,
                  ubuntu_24_imtcp_no_epoll,
-                 fedora_41, fedora_42,
+                 fedora_42, fedora_43,
                  ubuntu_20, ubuntu_24,
                  ubuntu_22_san, ubuntu_24_tsan, ubuntu_22_distcheck,
                  openeuler, wolfssl, elasticsearch]
@@ -211,7 +211,7 @@ jobs:
               # Note: we completely override the container configure options here!
               export RSYSLOG_CONFIGURE_OPTIONS_OVERRIDE="--enable-testbench --enable-omstdout \
                      --enable-imdiag --disable-imtcp-epoll --enable-imtcp-tests\
-                     --disable-impstats --disable-imfile --disable-imfile-tests \
+                     --disable-impstats --disable-impstats-push --disable-imfile --disable-imfile-tests \
                      --disable-fmhttp --enable-valgrind --enable-valgrind-testbench \
                      --disable-helgrind --disable-default-tests --disable-kafka-tests \
                      --disable-omkafka --disable-imkafka \
@@ -222,13 +222,13 @@ jobs:
               export RSYSLOG_CONFIGURE_OPTIONS_EXTRA="--disable-elasticsearch-tests \
                      --disable-kafka-tests"
               ;;
-          'fedora_41')
-              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_fedora:41'
+          'fedora_42')
+              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_fedora:42'
               export RSYSLOG_CONFIGURE_OPTIONS_EXTRA="--disable-elasticsearch-tests \
                      --disable-kafka-tests --enable-debug --enable-imdtls --enable-omdtls"
               ;;
-          'fedora_42')
-              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_fedora:42'
+          'fedora_43')
+              export RSYSLOG_DEV_CONTAINER='rsyslog/rsyslog_dev_base_fedora:43'
               export RSYSLOG_CONFIGURE_OPTIONS_EXTRA="--disable-elasticsearch-tests \
                      --disable-kafka-tests --enable-debug --enable-imdtls --enable-omdtls"
               ;;
@@ -340,6 +340,99 @@ jobs:
           devtools/gather-check-logs.sh
           cat failed-tests.log
 
+  package_build_rpm:
+    name: package build (RPM)
+    needs: compile
+    if: ${{ needs.compile.result == 'success' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    container:
+      image: quay.io/rockylinux/rockylinux:9
+      options: --privileged
+    steps:
+      - name: Install git (before checkout so it can clone)
+        run: dnf install -y git
+
+      - name: git checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: fetch upstream (for changed-files diff)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git remote add upstream https://github.com/${{ github.repository }}.git
+          git fetch upstream "${{ github.event.pull_request.base.ref }}"
+
+      - name: Check for code changes
+        id: code_changes
+        uses: tj-actions/changed-files@v46
+        with:
+          base_sha: ${{ github.event.pull_request.base.sha }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          files: |
+            **/*.c
+            **/*.h
+            grammar/lexer.l
+            grammar/grammar.y
+            tests/*.sh
+            diag.sh
+            **/Makefile.am
+            configure.ac
+            packaging/rpm/**
+            devtools/run-rpm-build.sh
+            .github/workflows/run_checks.yml
+          files_ignore: |
+            doc/Makefile.am
+
+      - name: run RPM build
+        if: steps.code_changes.outputs.any_changed == 'true'
+        run: |
+          chmod -R go+rw .
+          echo "== Install EPEL and mock =="
+          dnf install -y epel-release
+          dnf install -y mock dnf-utils
+          echo "== Install build tools for autoreconf/configure/make dist =="
+          dnf install -y autoconf automake libtool gcc make flex bison
+          echo "== Add Adiscon repo and install configure deps (libestr, libfastjson for make dist) =="
+          curl -fsSL -o /etc/pki/rpm-gpg/RPM-GPG-KEY-Adiscon https://download.adiscon.com/rpms/RPM-GPG-KEY-Adiscon
+          {
+            echo '[adiscon]'
+            echo 'name=adiscon'
+            echo "baseurl=https://rpms.adiscon.com/v8-stable/epel-9/\$basearch"
+            echo 'enabled=1'
+            echo 'gpgcheck=1'
+            echo 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Adiscon'
+          } > /etc/yum.repos.d/adiscon.repo
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y libestr-devel libfastjson4-devel zlib-devel libuuid-devel libgcrypt-devel libcurl-devel file protobuf-c-compiler protobuf-c-devel snappy-devel python3-docutils dos2unix
+          echo "== Copy mock configs =="
+          cp -v packaging/rpm/etc-mock/*.cfg /etc/mock/ || true
+          mkdir -p build-result /var/lib/mock
+          echo "== Run RPM build =="
+          bash devtools/run-rpm-build.sh
+
+      - name: Skip RPM build, no relevant changes
+        if: steps.code_changes.outputs.any_changed != 'true'
+        run: echo "No relevant changes detected; skipping RPM build."
+
+      - name: show error logs (if we errored)
+        if: ${{ failure() || cancelled() }}
+        run: |
+          tail -300 build-result/srpm/*.log 2>/dev/null || true
+          tail -300 build-result/rpms/*.log 2>/dev/null || true
+
+      - name: Upload RPM artifacts
+        if: steps.code_changes.outputs.any_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms-epel-9-x86_64
+          path: build-result/
+          if-no-files-found: error
+
   macos_CI:
     needs: compile
     if: ${{ needs.compile.result == 'success' }}
@@ -362,7 +455,7 @@ jobs:
             arch: arm64
             sanitizer: tsan
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     name: macOS CI (${{ matrix.os }}, ${{ matrix.arch }}, ${{ matrix.sanitizer }})
     env:
       USE_AUTO_DEBUG: true
@@ -455,7 +548,7 @@ jobs:
           autoreconf -fvi
           ./configure --enable-silent-rules --enable-testbench \
              --enable-imdiag --disable-imdocker --disable-imfile \
-             --disable-default-tests --disable-impstats --disable-imptcp \
+            --disable-default-tests --disable-impstats --disable-impstats-push --disable-imptcp \
              --disable-mmanon --disable-mmaudit --disable-mmfields \
              --disable-mmjsonparse --disable-mmpstrucdata \
              --disable-mmsequence --disable-mmutf8fix --disable-mail \
@@ -501,7 +594,8 @@ jobs:
             echo "Configuring AddressSanitizer options"
             export ASAN_OPTIONS=":halt_on_error=1:\
               check_initialization_order=1:strict_init_order=1:\
-              detect_stack_use_after_return=1:print_stacktrace=1"
+              detect_stack_use_after_return=1:print_stacktrace=1:\
+              disable_coredump=0"
           elif [ "${{ matrix.sanitizer }}" = "tsan" ]; then
             echo "Configuring ThreadSanitizer options"
             export TSAN_OPTIONS=":halt_on_error=1:\
@@ -662,7 +756,7 @@ jobs:
           autoreconf -fvi
           ./configure --enable-silent-rules --enable-testbench \
              --enable-imdiag --disable-imdocker --disable-imfile --disable-default-tests\
-             --disable-impstats --disable-imptcp --disable-mmanon --disable-mmaudit --disable-mmfields \
+             --disable-impstats --disable-impstats-push --disable-imptcp --disable-mmanon --disable-mmaudit --disable-mmfields \
              --disable-mmjsonparse --disable-mmpstrucdata --disable-mmsequence --disable-mmutf8fix \
              --disable-mail --disable-omprog --disable-improg --disable-omruleset --enable-omstdout \
              --disable-omuxsock --disable-pmaixforwardedfrom --disable-pmciscoios --disable-pmcisconames \
@@ -807,6 +901,9 @@ jobs:
             libtool \
             libtool-bin \
             libzstd-dev \
+            libprotobuf-c-dev \
+            protobuf-c-compiler \
+            libsnappy-dev \
             mysql-server \
             net-tools \
             postgresql-client libpq-dev \
@@ -1104,6 +1201,7 @@ jobs:
             --enable-imdiag \
             --disable-generate-man-pages \
             --disable-impstats \
+            --disable-impstats-push \
             --enable-imfile \
             --disable-imfile-tests \
             --disable-fmhttp \
@@ -1377,7 +1475,7 @@ jobs:
           chmod -R go+rw .
           set +e
           devtools/devcontainer.sh --rm devtools/run-static-analyzer.sh 2>&1 | tee clang-analyzer.log
-          echo "exitcode=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Upload clang static analyzer report
         if: ${{ always() && steps.code_changes.outputs.any_changed == 'true' }}
@@ -1392,8 +1490,8 @@ jobs:
       - name: Show clang static analyzer report link
         if: ${{ always() && steps.code_changes.outputs.any_changed == 'true' }}
         run: |
-          artifact=${{ steps.upload-report.outputs.artifact-url }}
-          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          artifact="${{ steps.upload-report.outputs.artifact-url }}"
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           Clang static analyzer HTML report (download):
           $artifact
           EOF
@@ -1455,7 +1553,7 @@ jobs:
         run: |
           chmod -R go+rw .
           export RSYSLOG_CONFIGURE_OPTIONS_OVERRIDE="--enable-testbench --enable-omstdout \
-                 --enable-imdiag --disable-impstats --enable-imfile --disable-imfile-tests \
+                 --enable-imdiag --disable-impstats --disable-impstats-push --enable-imfile --disable-imfile-tests \
                  --disable-fmhttp --enable-valgrind --enable-valgrind-testbench \
                  --disable-helgrind --disable-default-tests --enable-kafka-tests \
                  --disable-default-tests \
@@ -1482,3 +1580,183 @@ jobs:
       - name: Skip kafka distcheck CI, no relevant changes
         if: steps.code_changes.outputs.any_changed != 'true'
         run: echo "No relevant changes detected; skipping kafka distcheck CI."
+
+  arm_CI:
+    needs: compile
+    if: ${{ needs.compile.result == 'success' }}
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: armhf
+            runs_on: ubuntu-24.04
+            platform: linux/arm/v7
+            qemu_platform: arm
+            use_qemu: true
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+            platform: linux/arm64
+            qemu_platform: aarch64
+            use_qemu: false
+    name: ${{ matrix.arch }} CI (${{ matrix.use_qemu && 'QEMU' || 'native, asan' }})${{ matrix.arch == 'arm64' && ', asan' || '' }}
+    steps:
+      - name: git checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: fetch upstream (for changed-files diff)
+        run: |
+          git remote add upstream https://github.com/${{ github.repository }}.git
+          git fetch upstream "${{ github.event.pull_request.base.ref }}"
+
+      - name: Check for code changes
+        id: code_changes
+        uses: tj-actions/changed-files@v46
+        with:
+          base_sha: ${{ github.event.pull_request.base.sha }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          files: |
+            **/*.c
+            **/*.h
+            grammar/lexer.l
+            grammar/grammar.y
+            tests/*.sh
+            diag.sh
+            **/Makefile.am
+            configure.ac
+            .github/workflows/run_checks.yml
+            devtools/ci/Dockerfile.arm
+          files_ignore: |
+            doc/Makefile.am
+
+      - name: Set up QEMU for ${{ matrix.arch }} emulation
+        if: steps.code_changes.outputs.any_changed == 'true' && matrix.use_qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.qemu_platform }}
+
+      - name: Set up Docker Buildx
+        if: steps.code_changes.outputs.any_changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.arch }} dev image (cached)
+        if: steps.code_changes.outputs.any_changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: devtools/ci/Dockerfile.arm
+          platforms: ${{ matrix.platform }}
+          tags: rsyslog-arm-dev:${{ matrix.arch }}
+          load: true
+          cache-from: type=gha,scope=arm-dev-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=arm-dev-${{ matrix.arch }}
+
+      - name: Run ${{ matrix.arch }} build and testbench
+        if: steps.code_changes.outputs.any_changed == 'true'
+        run: |
+          chmod -R go+rw .
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e ARCH=${{ matrix.arch }} \
+            --cap-add SYS_ADMIN \
+            --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -v "${{ github.workspace }}:/rsyslog" \
+            -w /rsyslog \
+            rsyslog-arm-dev:${{ matrix.arch }} bash -c '
+              set -e
+              export CFLAGS="-g -O1 -fno-omit-frame-pointer"
+              export CC=gcc
+              export TEST_MAX_RUNTIME=1200
+              autoreconf -fvi
+              if [ "$ARCH" = "armhf" ]; then
+                ./configure --enable-silent-rules --enable-testbench \
+                  --enable-imdiag --disable-imdocker --disable-imfile \
+                  --disable-default-tests --disable-impstats \
+                  --disable-impstats-push \
+                  --disable-imptcp \
+                  --disable-mmanon --disable-mmaudit \
+                  --disable-mmfields --disable-mmjsonparse \
+                  --disable-mmpstrucdata --disable-mmsequence \
+                  --disable-mmutf8fix --disable-mail \
+                  --disable-omprog --disable-improg \
+                  --disable-omruleset \
+                  --enable-omstdout --disable-omuxsock \
+                  --disable-pmaixforwardedfrom --disable-pmciscoios \
+                  --disable-pmcisconames --disable-pmlastmsg \
+                  --disable-pmsnare \
+                  --disable-libgcrypt --disable-mmnormalize \
+                  --disable-omudpspoof --disable-relp \
+                  --disable-mmsnmptrapd \
+                  --enable-gnutls --enable-usertools \
+                  --disable-mysql \
+                  --disable-valgrind --disable-mmkubernetes \
+                  --disable-omkafka --disable-imkafka \
+                  --disable-ommongodb --disable-omrabbitmq \
+                  --disable-mmdarwin \
+                  --disable-helgrind --disable-uuid \
+                  --disable-fmhttp
+              else
+                export CFLAGS="-g -O1 -fno-omit-frame-pointer -fsanitize=address -fsanitize-address-use-after-scope"
+                export LDFLAGS="-fsanitize=address"
+                export ASAN_OPTIONS="abort_on_error=1:symbolize=1:detect_leaks=0:disable_coredump=0"
+                ./configure --enable-silent-rules --enable-testbench \
+                  --enable-imdiag --disable-imdocker \
+                  --enable-imfile --disable-imfile-tests \
+                  --enable-impstats --enable-imptcp \
+                  --enable-mmanon --enable-mmaudit \
+                  --enable-mmfields --enable-mmjsonparse \
+                  --enable-mmpstrucdata --enable-mmsequence \
+                  --enable-mmutf8fix --enable-mail \
+                  --enable-omprog --enable-improg \
+                  --enable-omruleset --enable-omstdout \
+                  --enable-omuxsock \
+                  --disable-pmnormalize \
+                  --enable-pmaixforwardedfrom --enable-pmciscoios \
+                  --enable-pmcisconames --enable-pmlastmsg \
+                  --enable-pmsnare --enable-libgcrypt \
+                  --disable-mmnormalize --disable-omudpspoof \
+                  --enable-relp --enable-mmsnmptrapd \
+                  --enable-gnutls --enable-usertools \
+                  --disable-mysql \
+                  --disable-valgrind --disable-mmkubernetes \
+                  --disable-omkafka --disable-imkafka \
+                  --disable-ommongodb --disable-omrabbitmq \
+                  --disable-mmdarwin \
+                  --disable-helgrind --enable-uuid \
+                  --disable-fmhttp \
+                  --disable-elasticsearch-tests \
+                  --disable-kafka-tests --disable-snmp-tests
+              fi
+              make -j8
+              make -j3 check
+            '
+
+      - name: Collect test logs
+        if: ${{ always() && steps.code_changes.outputs.any_changed == 'true' }}
+        run: devtools/gather-check-logs.sh || true
+
+      - name: Upload ${{ matrix.arch }} test logs
+        if: ${{ always() && steps.code_changes.outputs.any_changed == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-test-logs
+          path: |
+            tests/test-suite.log
+            failed-tests.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: show error logs (if we errored)
+        if: ${{ (failure() || cancelled()) && steps.code_changes.outputs.any_changed == 'true' }}
+        run: |
+          devtools/gather-check-logs.sh
+          cat failed-tests.log
+
+      - name: Skip ${{ matrix.arch }} CI, no relevant changes
+        if: steps.code_changes.outputs.any_changed != 'true'
+        run: echo "No relevant changes detected; skipping ${{ matrix.arch }} CI."

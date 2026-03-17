@@ -12,6 +12,11 @@ ROSI Collector (Rsyslog Operations Stack Initiative):
 
 :doc:`../deployments/rosi_collector/index`
 
+For the beginner-level ROSI concepts (open approach, freedom of choice, and
+vendor lock-in guardrails), see:
+
+:doc:`rosi_for_beginners`
+
 ROSI Collector provides:
 
 - Centralized log aggregation from multiple hosts
@@ -47,6 +52,10 @@ Advanced Tutorials
 For more examples and step-by-step guides, visit:
 
 :doc:`../tutorials/index`
+
+For impstats metrics push setup, see:
+
+:doc:`../tutorials/impstats_push_victoriametrics`
 
 Community and AI Assistant
 --------------------------

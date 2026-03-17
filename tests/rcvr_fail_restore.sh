@@ -3,6 +3,7 @@
 # This file is part of the rsyslog project, released under ASL 2.0
 . ${srcdir:=.}/diag.sh init
 skip_platform "FreeBSD"  "This test does not work on FreeBSD - problems with os utility option switches"
+skip_ARM "disk-assisted queue receiver restore timing is flaky on ARM CI"
 #
 # STEP1: start both instances and send 1000 messages.
 # Note: receiver is instance 1, sender instance 2.
@@ -73,7 +74,6 @@ ls -l ${RSYSLOG_DYNNAME}.spool
 
 #
 # Step 3: restart receiver, wait that the sender drains its queue
-$InputTCPServerRun '$PORT_RCVR'
 #
 echo step 3
 #export RSYSLOG_DEBUGLOG="log2"

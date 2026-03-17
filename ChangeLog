@@ -1,5 +1,162 @@
----------------------------------------------------------------------------------------
-Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-??
+--------------------------------------------------------------------------------------
+Scheduled Release 8.2604.0 (aka 2026.04) 2026-04-??
+- 2026-03-16: rpm: packaging overhaul, CI job, and review fixes
+  - Add package_build_rpm CI job (Rocky Linux 8, mock, EPEL 8)
+  - Add devtools/run-rpm-build.sh for CI RPM builds via mock
+  - Add packaging/rpm/ with build-rpms.sh, config.sh, mock configs
+  - Add packaging/rpm/rpmbuild/ (SPECS, SOURCES) for rsyslog and deps
+  - Main spec: rsyslog-v8-stable.spec (EL8/EL9, RHEL 7 dropped)
+  - qpid-proton tarballs as Source5/Source6 with SHA256 checksums
+  - libfastjson4 Source0: GitHub refs/tags/v%{version} URL
+  - build-rpms.sh: atomic downloads, GPG --batch --pinentry-mode loopback
+  - Fix duplicate changelog NVR 8.2008.0-2 -> 8.2008.0-3 (Sep 29 2020)
+  - .gitignore: root-anchored /build-result/
+  - doc/BUILDS_README.md: document why pip is needed for RPM Sphinx build
+  closes: https://github.com/rsyslog/rsyslog/issues/6584
+- 2026-03-16: github: assign maintainers to CODEOWNERS coverage
+  Ensure GitHub code owner review applies consistently to repository
+  metadata, CI, build tooling, and the default source tree.
+  Security-sensitive paths now require review from the listed
+  maintainers when branch protection enforces code owner approval.
+- 2026-03-16: tls: add native post-quantum guidance and tests
+  Native post-quantum TLS support should be usable and testable on newer
+  distro baselines without adding provider-mode compatibility work for
+  older platforms.
+  Rsyslog now has native-PQ smoke tests, clearer TLS diagnostics, updated
+  CI baselines and helper images, and a new post-quantum tutorial for
+  supported distros.
+- 2026-03-16: ci: upgrade RPM CI from Rocky Linux 8 / EPEL-8 to Rocky Linux 9 / EPEL-9
+  Align CI with current Rocky Linux and EPEL versions for ongoing
+  support and security.
+  Impact:
+    RPM build job and mock defaults now target EL9; artifact names change.
+  Before: Rocky Linux 8 container, epel-8 repo, powertools, epel-8-x86_64.
+  After:  Rocky Linux 9 container, epel-9 repo, crb, epel-9-x86_64.
+- 2026-03-16: doc: Fix Mermaid diagrams and unify build output to build/
+  Mermaid diagrams fail on GitHub Pages PR previews and when opening
+  built HTML via file://. ES module imports use wrong paths and CORS
+  blocks file://. Two build paths (build/ vs build/html/) caused
+  confusion and inconsistent fix application.
+  Impact:
+    Doc build output path unified; Mermaid diagrams render in offline,
+    online, and RPM builds.
+- 2026-03-16: CI: added deterministic project policy checks
+  The idea is to identify bad patches that do not follow project best
+  practices. Among others, the hope is that this can identify "AI Slop" as it
+  often violates policies.
+  Note that we intentionally use deterministic (non-AI) checks. A similiar
+  check via AI is also added to the repo, but it is no artifact.
+  All of these checks are experimental.
+- 2026-02-27: ratelimit: wire ratelimit.name into remaining modules
+  Why: Commit 3ee31a8d0 added shared named ratelimit support
+  (ratelimit.name + ratelimitNewFromConfig) but only wired it
+  into imtcp, imptcp, and imudp. Seven modules with existing
+  ratelimit.interval/ratelimit.burst support were left without
+  the ability to reference shared ratelimit() objects.
+  Impact: Adds ratelimit.name parameter to omfwd,
+  omelasticsearch, omhttp, imhttp, imjournal, imklog, and
+  imuxsock. Existing configurations remain unchanged.
+  Before: These seven modules could only use inline
+  ratelimit.interval/ratelimit.burst parameters.
+  After: All modules can now reference shared ratelimit()
+  configuration objects via ratelimit.name.
+  Technical Overview:
+  For each module, the same pattern from the imudp reference
+  implementation is applied:
+  - Add uchar *pszRatelimitName to config struct
+  - Add ratelimit.name to cnfparamdescr
+  - Change interval/burst defaults to -1 (sentinel)
+  - Parse ratelimit.name in config handler
+  - Add mutual-exclusivity check (name vs interval/burst)
+  - Branch ratelimiter creation on pszRatelimitName:
+  if set, call ratelimitNewFromConfig(); else legacy path
+  - Free pszRatelimitName in destructor
+  imuxsock is the most complex: it supports both per-socket
+  ratelimit.name and syssock.ratelimit.name, with the
+  per-source hashtable ratelimiter path also updated.
+  imklog uses legacy parameter names (ratelimitinterval,
+  ratelimitburst) but the new parameter uses the dotted
+  form (ratelimit.name) for consistency.
+  Each module receives a parameter doc page, module doc
+  update, and a config-validation test.
+- 2026-02-27: omusrmsg: add ratelimit support
+  Add ratelimit.interval, ratelimit.burst, and ratelimit.name parameters
+  to omusrmsg. This prevents scenarios where emergency message floods
+  can overwhelm user terminals.
+  closes: https://github.com/rsyslog/rsyslog/issues/4547
+- 2026-02-27: imrelp: add ratelimit support (interval, burst, name)
+  Wire ratelimit.interval, ratelimit.burst, and ratelimit.name into imrelp,
+  following the established pattern from imtcp/imptcp/imudp. When
+  ratelimit.name is set, the listener uses a shared named rate limiter
+  (with per-source support). Local interval/burst and named rate limiters
+  are mutually exclusive.
+- 2026-02-26: omkafka: add poll thread; fix races and deprecated usleep
+  When statistics.interval.ms is enabled, librdkafka queues stats
+  callbacks until rd_kafka_poll() is called. Idle actions can go
+  long periods without polling, causing queue buildup and memory
+  growth. Additionally, the stop flag for the new thread lacked
+  synchronization, and a poller startup failure could leave bIsOpen
+  in an inconsistent state.
+  Stats callbacks are now drained continuously even when no new
+  messages arrive. Thread shutdown is race-free. Action startup
+  succeeds even when the optional poll thread cannot start.
+  Deprecated usleep() is replaced by rsyslog's srSleep() wrapper.
+- 2026-02-26: omotel: add native protobuf encoding (http/protobuf)
+  The omotel module only supported JSON encoding for OTLP/HTTP
+  exports. Native protobuf encoding produces smaller payloads with
+  lower serialization overhead, which is the preferred transport for
+  high-volume OpenTelemetry deployments.
+  Users can now set protocol="http/protobuf" to use binary
+  protobuf encoding. The default remains "http/json". A pre-existing
+  bug in JSON timestamp encoding (timeUnixNano/observedTimeUnixNano
+  emitted as integers instead of strings) is also fixed.
+- 2026-02-25: CI: improve doc correctness checks (deterministic)
+- 2026-02-25: doc: fixed doc link issues
+  Some hyperlinks were invalidly generated and resulted in 404 errors
+- 2026-02-24: rsyslogd: send systemd watchdog keepalive pings
+  Some deployments rely on systemd watchdog restarts when the daemon
+  becomes unresponsive. rsyslogd announced readiness but never sent
+  watchdog heartbeats.
+  When WatchdogSec is configured, rsyslogd now sends periodic
+  WATCHDOG=1 notifications while running.
+- 2026-02-23: queue: further harden diskqueue recovery and shutdown race handling
+  This combines two related hardening steps for disk queue reliability:
+  - robust corruption detection/recovery handling in disk queue state/file validation
+  - worker startup cancellation-race closure that could lead to shutdown wait loops
+  Impact:
+  - disk queue scan now rejects out-of-range segment sequence numbers early and
+    reports corruption deterministically.
+  - worker startup no longer exposes a cancellation window before cleanup
+    registration.
+  - test/CI diagnostics preserve timeout backtraces (gdb) in ARM jobs and print
+    them to stdout for post-mortem debugging.
+  - test script cleanup removes redundant operations and uses a macOS-friendlier
+    segment enumeration path.
+- 2026-02-23: runtime: close worker-start cancellation race
+  Worker shutdown cancellation can race with worker startup. In wtpWorker(),
+  state was published as WRKTHRD_RUNNING before the cancellation cleanup
+  handler was registered. If pthread_cancel() hit in that window, cleanup could
+  be skipped and the worker remained visible as RUNNING.
+  Impact:
+  Prevents shutdown hangs where wtiCancelThrd() loops waiting for a worker that
+  was canceled before its cleanup path could transition state to WAIT_JOIN.
+- 2026-02-22: ci: enable core dumps in ASAN builds
+  AddressSanitizer by default sets disable_coredump=1, which prevents
+  core file generation even when abort() is called. This commit adds
+  disable_coredump=0 to ASAN_OPTIONS in both macOS and ARM64 workflows
+  to ensure core dumps are generated on crashes.
+  This allows diag.sh to find and analyze core files for better
+  debugging of test failures in ASAN-enabled CI jobs.
+- 2026-02-18: build: fix linking issue with libyaml
+  When building rsyslogd with libyaml support, the library was not being
+  explicitly linked. This implementation adds $(LIBYAML_LIBS) to
+  rsyslogd_LDADD to resolve undefined references during linking,
+  particularly in static or cross-compilation scenarios.
+  Thanks to Rudi Heitbaum for bringing up this isuse and suggesting the fix.
+ Fixes https://github.com/rsyslog/rsyslog/issues/6563
+- 2026-02-18: doc: add support for optionally using Google Analytics
+--------------------------------------------------------------------------------------
+Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-17
 - NEW DEPENDENCES: names vary by distribution
   - libyaml-dev
   - libprotobuf-c-dev   (module dependency)
@@ -10,6 +167,9 @@ Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-??
   is to prevent spamming the log to much in extreme cases. For some
   users, this may be too low and need to be adjusted. We excect this
   to be an exotic case, thus the change of default.
+- NEW DOC generation now via autotools integrated Makefile.am. This may
+  require changes to the doc build system (not in all cases, but it needs
+  to be checked).
 
 - overall improved documentation via a large set of topic updates.
 
@@ -108,6 +268,12 @@ Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-??
   `-Werror`.
   closes https://github.com/rsyslog/rsyslog/issues/5628
 - 2026-02-03: doc: document pcre_match function
+- 2026-01-31: impstats: add VictoriaMetrics push via Remote Write
+  Adds first-class integration with VictoriaMetrics to simplify ops
+  dashboards and move toward project-supported telemetry without
+  sidecar collectors.
+  New optional feature (oin by default). No behavior change unless configured
+  via push.* parameters. Also relevant doc and CI enhancements added.
 - 2026-01-31: imtcp: add MultiLine and regex framing support
   Non-technical: improves operator ergonomics and closes a feature gap
   with imptcp. Enables regex-based start-of-frame detection and optional
@@ -134,16 +300,6 @@ Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-??
   of silently continuing and reporting success. This has now been fixed
   and a proper error message is emitted.
   closes https://github.com/rsyslog/rsyslog/issues/2816
-- 2026-01-29: queue: fix slow drain of disk-assisted queues
-  Disk-assisted queues were taking days to drain after recovery
-  because the DA worker only activated when the in-memory queue
-  reached the high watermark, creating a catch-22 when starting
-  with an empty memory queue but full disk queue.
-  Impact:
-  This fix enables proper recovery from backlogs and prevents data
-  loss from queues that cannot drain. Existing behavior for normal
-  operations is preserved.
-  closes https://github.com/rsyslog/rsyslog/issues/2646
 - 2026-01-27: imfile: add inode generation check for file rotation detection
   This commit adds a check for inode generation number in the imfile module.
   This addresses an issue where file rotation is not detected when a new file
@@ -213,7 +369,6 @@ Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-??
   suitable for all applications. See documentation for full details.
   Upcoming work is expected to improve the state.
   Thanks to Daniel Gollub for the patch.
-- 2026-01-19:
 - 2026-01-17: make mmutf8fix work also on tags
   Thanks to Jan Jeroným Zvánovec for the base patch, which we improved a bit.
 - 2026-01-16: queue: harden disk recovery after invalid .qi
@@ -252,6 +407,33 @@ Scheduled Release 8.2602.0 (aka 2026.02) 2026-02-??
   Note that the ossl driver can either be build for wolfssl, libressl, or
   openssl. This needs to be decided at build time.
   Thanks to Hayden Roche for the contribution.
+- 2026-01-15: observability: add ROSI Collector centralized log collection stack
+  Add production-ready Docker Compose stack for centralized log collection
+  and monitoring, migrated from rsyslog-do-infra/central-intern.
+  ROSI (RSyslog Operations Stack Initiative) Collector provides:
+  - rsyslog log receiver with omhttp output to Loki
+  - Grafana Loki for log storage (30-day retention)
+  - Grafana with 5 pre-built dashboards
+  - Prometheus for metrics collection
+  - Traefik reverse proxy with automatic Let's Encrypt TLS
+  - TLS/mTLS syslog reception on port 6514 (RFC 5425)
+  TLS support features:
+  - Optional TLS profile activated via: docker compose --profile tls up -d
+  - Environment variable configuration (ENABLE_TLS, TLS_CA_FILE, etc.)
+  - Auth modes: anon, x509/certvalid, x509/name
+  - generate-ca.sh: Create CA and server certificates
+  - generate-client-cert.sh: Generate client certs with secure one-time
+    download packages, migration handling, and syslog user ownership
+  - Automatic UFW firewall configuration for port 6514
+  Management scripts installed to /usr/local/bin:
+  - rosi-monitor: Stack health monitoring and debugging
+  - rosi-generate-ca: Generate CA and server TLS certificates
+  - rosi-generate-client-cert: Generate client TLS certificates
+  - prometheus-target: Manage node exporter scrape targets
+  Configuration persistence via XDG-compliant config files:
+  - System: /etc/rsyslog/rosi-collector.conf
+  - User: ~/.config/rsyslog/rosi-collector.conf
+  closes: https://github.com/rsyslog/rsyslog/issues/6323
 - 2026-01-13: rainerscript: add append_json() function
   Thanks to github user 20syldev for the patch.
 - 2026-01-12: imfile: ensure state files are deleted correctly on log rotation

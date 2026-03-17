@@ -13,6 +13,7 @@
 
 import json
 import os
+import re
 import sys
 from urllib.parse import urljoin
 
@@ -44,9 +45,15 @@ edit_on_github_branch = 'main'
 
 # Configure local copies of the JavaScript assets that power the Mermaid
 # diagrams so that the generated HTML does not fetch files from a CDN.
-# Use non-module builds to avoid CORS issues with file:// URLs
+#
+# Design choice: UMD (mermaid.min.js) over ESM for file:// support.
+# ES modules are blocked by CORS when opening HTML via file:// (browser security).
+# Using UMD + monkey-patch to strip type="module" allows offline viewing.
+# Trade-off: ELK layout is not available in offline mode (fix-mermaid-offline.py
+# removes the ELK script tag). For HTTP-served docs, ELK would work with ESM;
+# we prioritize file:// compatibility so built docs work without a local server.
 MERMAID_JS_PATH = 'vendor/mermaid/mermaid.min.js'
-MERMAID_ELK_JS_PATH = 'vendor/mermaid/mermaid-layout-elk.esm.min.mjs'  # Keep ES module for ELK
+MERMAID_ELK_JS_PATH = 'vendor/mermaid/mermaid-layout-elk.esm.min.mjs'  # Stripped by fix script for file://
 D3_JS_PATH = 'vendor/d3/d3.min.js'
 
 mermaid_use_local = MERMAID_JS_PATH
@@ -116,9 +123,11 @@ window.addEventListener("load", () => {{
     mermaid_init_js = """
 window.addEventListener("load", () => {
     if (typeof mermaid !== 'undefined') {
-        // Note: ELK layout is not available in non-module builds
-        // Basic Mermaid functionality will work without ELK
-        mermaid.initialize({startOnLoad:false});
+        // Force Dagre renderer; ELK is not available in non-module builds (CORS with file://)
+        mermaid.initialize({
+            startOnLoad: false,
+            flowchart: { defaultRenderer: 'dagre' }
+        });
     }
 });
 """.strip()
@@ -126,49 +135,28 @@ window.addEventListener("load", () => {
     _original_install_js = _sphinx_mermaid.install_js
 
     def _vendored_install_js(app, *args, **kwargs):
-        """Force sphinxcontrib-mermaid to load the vendored JavaScript."""
+        """Force sphinxcontrib-mermaid to load the vendored UMD JavaScript (file:// compatible)."""
 
-        if hasattr(app.config, 'mermaid_use_local'):
-            app.config.mermaid_use_local = MERMAID_JS_PATH
-            app.config.mermaid_elk_use_local = MERMAID_ELK_JS_PATH
-            app.config.d3_use_local = D3_JS_PATH
-            app.config.mermaid_init_js = mermaid_init_js
-            return _original_install_js(app, *args, **kwargs)
+        app.config.mermaid_use_local = MERMAID_JS_PATH
+        app.config.mermaid_elk_use_local = MERMAID_ELK_JS_PATH
+        app.config.d3_use_local = D3_JS_PATH
+        app.config.mermaid_init_js = mermaid_init_js
 
         original_add_js_file = app.add_js_file
-        original_init_js = getattr(app.config, 'mermaid_init_js', '')
 
-        def _rewrite_js_file(filename, **file_kwargs):
-            if filename:
-                if 'mermaid-layout-elk' in filename:
-                    filename = MERMAID_ELK_JS_PATH
-                    file_kwargs.setdefault('type', 'module')
-                elif 'mermaid' in filename and not filename.endswith('.mjs'):
-                    filename = MERMAID_JS_PATH
-                    # Explicitly remove module type for main mermaid script
-                    file_kwargs.pop('type', None)
-                    file_kwargs.pop('async', None)
-                elif 'd3' in filename and filename.endswith('.js'):
-                    filename = D3_JS_PATH
-            return original_add_js_file(filename, **file_kwargs)
-
-        # Also monkey-patch the app.add_js_file method to intercept Mermaid scripts
         def _intercept_add_js_file(filename, **file_kwargs):
-            # Only target our specific vendored Mermaid files
+            # Remove type=module from UMD mermaid script so it works with file:// URLs
             if filename and any(vendor_path in filename for vendor_path in [MERMAID_JS_PATH, MERMAID_ELK_JS_PATH]):
                 if 'mermaid' in filename and not filename.endswith('.mjs'):
-                    # Remove module type for Mermaid scripts
                     file_kwargs.pop('type', None)
                     file_kwargs.pop('async', None)
             return original_add_js_file(filename, **file_kwargs)
 
         try:
             app.add_js_file = _intercept_add_js_file  # type: ignore[assignment]
-            app.config.mermaid_init_js = mermaid_init_js
             return _original_install_js(app, *args, **kwargs)
         finally:
             app.add_js_file = original_add_js_file  # type: ignore[assignment]
-            app.config.mermaid_init_js = original_init_js
 
     _sphinx_mermaid.install_js = _vendored_install_js
 
@@ -186,7 +174,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'rsyslog'
-copyright = u'2008-2022, Rainer Gerhards and Others'
+copyright = u'2008-2026, Rainer Gerhards and Others'
 author = u'Rainer Gerhards and Others'
 
 
@@ -228,14 +216,27 @@ rst_epilog = """
 # real values will be generated dynamically from info in the repo. If the
 # user builds the docs from "bare" sources not yet processed
 ###############################################################################
-version = '8.2512'
-#release = '8.2512.0'
+version = '8.2604'
+#release = '8.2604.0'
 release = version + ' daily stable'
 
+# Allow override from environment (e.g. Docker/CI builds without .git)
+_env_version = os.environ.get('RSYSLOG_DOC_VERSION')
+_env_release_type = os.environ.get('RSYSLOG_DOC_RELEASE_TYPE')
+if _env_version and _env_release_type:
+    version = _env_version
+    release_type = _env_release_type
+    release = f"{version} daily {release_type}"
+    if release_type == 'dev':
+        release_string_detail = 'simple'
+    rst_prolog = rst_prolog.format(
+        doc_build=release,
+        doc_commit='N/A',
+        doc_branch='N/A')
 # For this to be true, it means that we are not attempting to build from
 # a release tarball, as otherwise the values above would have been replaced
 # with official stable release values.
-if version == '8':
+elif version == '8':
 
     # Confirm that a .git folder is available. If not, skip all
     # following steps intended to generate daily stable build values for
@@ -366,9 +367,11 @@ suppress_warnings = ['epub.unknown_project_files']
 # -- Options for HTML output ---------------------------------------------------
 
 # The base URL which points to the root of the HTML documentation.
-# It is used to indicate the location of document like canonical_url.
-RSYSLOG_BASE_URL = 'https://www.rsyslog.com'
-html_baseurl = f'{RSYSLOG_BASE_URL}/doc/'
+# It is used to indicate the location of document like canonical_url and sitemap.
+# DOC_BASE_URL env (e.g. https://docs.rsyslog.com) overrides when set (CI deploy).
+RSYSLOG_BASE_URL = 'https://docs.rsyslog.com'
+_doc_base = os.environ.get('DOC_BASE_URL', '').rstrip('/')
+html_baseurl = f'{_doc_base}/doc/' if _doc_base else f'{RSYSLOG_BASE_URL}/doc/'
 
 DISABLE_JSON_LD = os.environ.get('DISABLE_JSON_LD', '').lower() in ('1', 'true', 'yes')
 ENABLE_JSON_LD = not DISABLE_JSON_LD
@@ -387,6 +390,26 @@ if tags.has('with_sitemap'):
         sitemap_url_scheme = "{link}"
         sitemap_localtolinks = False
         sitemap_filename = "sitemap.xml"
+
+# Enable Google Analytics tracking when a tracking ID is provided via
+# the GOOGLE_ANALYTICS_ID environment variable.
+_ga_id = os.environ.get('GOOGLE_ANALYTICS_ID', '')
+if _ga_id and not re.match(r'^(UA-\d+-\d+|G-[A-Za-z0-9]+)$', _ga_id):
+    print("Warning: Invalid GOOGLE_ANALYTICS_ID format: '%s'. "
+          "Disabling GA." % _ga_id, file=sys.stderr)
+    _ga_id = ''
+_ga_use_extension = False
+if _ga_id:
+    try:
+        import sphinxcontrib.googleanalytics  # type: ignore  # noqa: F401
+    except ImportError:
+        # Extension not installed – fall back to metatags injection in setup().
+        pass
+    else:
+        extensions.append('sphinxcontrib.googleanalytics')
+        googleanalytics_id = _ga_id
+        googleanalytics_enabled = True
+        _ga_use_extension = True
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
@@ -584,6 +607,25 @@ def setup(app):
 
     if ENABLE_JSON_LD:
         app.connect('html-page-context', _add_json_ld_to_context)
+
+    # Google Analytics: inject gtag script via metatags when the
+    # sphinxcontrib.googleanalytics extension is not handling it.
+    if _ga_id and not _ga_use_extension:
+        def _inject_ga(app, pagename, templatename, context, doctree):
+            if app.builder.format == 'html':
+                m = context.get('metatags', '')
+                m += (
+                    '\n<script async src="https://www.googletagmanager.com/'
+                    'gtag/js?id=%s"></script>\n'
+                    '<script>\n'
+                    'window.dataLayer = window.dataLayer || [];\n'
+                    'function gtag(){dataLayer.push(arguments);}\n'
+                    'gtag("js", new Date());\n'
+                    'gtag("config", "%s");\n'
+                    '</script>\n'
+                ) % (_ga_id, _ga_id)
+                context['metatags'] = m
+        app.connect('html-page-context', _inject_ga)
 
 
 def _add_json_ld_to_context(app, pagename, templatename, context, doctree):
