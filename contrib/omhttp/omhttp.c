@@ -216,6 +216,8 @@ typedef struct instanceConf_s {
     sbool *serverCheckInProgress; /* Array: Is a worker already probing server N? */
     pthread_mutex_t mutGlobalState; /* Protects these arrays */
 
+    sbool curlDebugMode;
+
 } instanceData;
 
 struct modConfData_s {
@@ -311,6 +313,7 @@ static struct cnfparamdescr actpdescr[] = {
     {"profile", eCmdHdlrGetWord, 0},
     {"statsbysenders", eCmdHdlrBinary, 0},
     {"healthchecktimedelay", eCmdHdlrInt, 0},
+    {"curldebugmode", eCmdHdlrBinary, 0},
 };
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
@@ -541,6 +544,7 @@ BEGINdbgPrintInstInfo
     dbgprintf("\tratelimit.burst='%d'\n", pData->ratelimitBurst);
     dbgprintf("\tstatsname='%s'\n", pData->statsName);
     dbgprintf("\tstatsbysenders='%d'\n", pData->statsBySenders);
+    dbgprintf("\tcurldebugmode='%d'\n", pData->curlDebugMode);
 ENDdbgPrintInstInfo
 
 
@@ -2091,8 +2095,10 @@ static void ATTR_NONNULL()
         cRet = curl_easy_setopt(handle, CURLOPT_SSL_SESSIONID_CACHE, 1L);
         if (cRet != CURLE_OK) DBGPRINTF("omhttp: curlSetupCommon unknown option CURLOPT_SSL_SESSIONID_CACHE\n");
     }
-    /* uncomment for in-dept debuggung:
-    curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
+    if (pData->curlDebugMode){
+        /* uncomment for in-dept debuggung */
+        curl_easy_setopt(handle, CURLOPT_VERBOSE, 1L);
+    } 
 }
 
 static void ATTR_NONNULL() curlCheckConnSetup(wrkrInstanceData_t *const pWrkrData, serverData_t *serverData) {
@@ -2242,6 +2248,7 @@ static void ATTR_NONNULL() setInstParamDefaults(instanceData *const pData) {
     pData->nIgnorableCodes = 0;
     pData->ignorableCodes = NULL;
     pData->statsBySenders = 0;  // Disable by default
+    pData->curlDebugMode = 0; // Disable by default
     // increment number of instances
     ++omhttpInstancesCnt;
 }
@@ -2714,6 +2721,8 @@ BEGINnewActInst
             profileName = es_str2cstr(pvals[i].val.d.estr, NULL);
         } else if (!strcmp(actpblk.descr[i].name, "statsbysenders")) {
             pData->statsBySenders = pvals[i].val.d.n;
+        } else if (!strcmp(actpblk.descr[i].name, "curldebugmode")) {
+            pData->curlDebugMode = pvals[i].val.d.n;
         } else {
             LogError(0, RS_RET_INTERNAL_ERROR,
                      "omhttp: program error, "
